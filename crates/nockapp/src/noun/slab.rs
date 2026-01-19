@@ -630,7 +630,7 @@ pub fn slab_noun_equality(a: &Noun, b: &Noun) -> bool {
     }
 }
 
-fn slab_mug(a: Noun) -> u32 {
+pub fn slab_mug(a: Noun) -> u32 {
     let mut stack = vec![a];
     while let Some(noun) = stack.pop() {
         if let Ok(mut allocated) = noun.as_allocated() {
