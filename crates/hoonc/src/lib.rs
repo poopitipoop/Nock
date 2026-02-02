@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::env::current_dir;
 use std::ffi::OsStr;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use clap::{ColorChoice, Parser};
 use nockapp::driver::Operation;
 use nockapp::kernel::boot::{self, default_boot_cli, Cli as BootCli};
@@ -29,7 +31,8 @@ pub type Error = Box<dyn std::error::Error>;
 
 pub static KERNEL_JAM: &[u8] = include_bytes!("../bootstrap/hoonc.jam");
 pub static PREWARM_STATE_JAM: &[u8] = include_bytes!("../bootstrap/hoonc-prewarm.jam");
-pub static HOON_TXT: &[u8] = include_bytes!("../hoon/hoon-138.hoon");
+pub static HOON_138_HOON: &[u8] = include_bytes!("../hoon/hoon-138.hoon");
+pub static HOON_TXT: &[u8] = HOON_138_HOON;
 
 #[derive(Clone, Parser, Debug)]
 #[command(about = "Tests various poke types for the kernel", author = "zorp", version, color = ColorChoice::Auto)]
@@ -181,6 +184,47 @@ pub async fn build_jam(
     run_build(nockapp, Some(out_path.clone())).await
 }
 
+/// Builds a jam after priming the hoonc parse cache with native parser ASTs.
+///
+/// `native_asts` must be keyed by canonical, absolute file paths and contain
+/// jammed hoon ASTs for files in the dependency directory.
+pub async fn build_jam_with_primed_parse_cache(
+    entry: PathBuf,
+    deps_dir: PathBuf,
+    out_dir: Option<PathBuf>,
+    arbitrary: bool,
+    new: bool,
+    native_asts: &HashMap<PathBuf, Vec<u8>>,
+) -> Result<Vec<u8>, Error> {
+    info!("Dependencies directory: {:?}", deps_dir);
+    info!("Entry file: {:?}", entry);
+    let (mut nockapp, out_path) =
+        initialize_with_default_cli(entry.clone(), deps_dir.clone(), out_dir, arbitrary, new)
+            .await
+            .map_err(|err| -> Error {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("primed init failed for {}: {err}", entry.display()),
+                ))
+            })?;
+    prime_parse_cache(&mut nockapp, &entry, &deps_dir, native_asts)
+        .await
+        .map_err(|err| -> Error {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("prime parse cache failed for {}: {err}", entry.display()),
+            ))
+        })?;
+    run_build(nockapp, Some(out_path.clone()))
+        .await
+        .map_err(|err| -> Error {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("primed build failed for {}: {err}", entry.display()),
+            ))
+        })
+}
+
 pub async fn initialize_hoonc(cli: HoonCli) -> Result<(nockapp::NockApp, PathBuf), Error> {
     initialize_hoonc_(
         cli.entry,
@@ -216,6 +260,131 @@ pub async fn initialize_with_default_cli(
     initialize_hoonc_(entry, deps_dir, arbitrary, out, cli).await
 }
 
+async fn build_directory_noun(
+    slab: &mut NounSlab<NockJammer>,
+    deps_dir: &PathBuf,
+) -> Result<Noun, Error> {
+    let directory = canonicalize_and_string(deps_dir);
+    let mut directory_noun = D(0);
+    let walker = WalkDir::new(&directory).follow_links(true).into_iter();
+
+    for entry_result in walker.filter_entry(is_valid_file_or_dir) {
+        let entry = entry_result?;
+        if !entry.metadata()?.is_file() {
+            continue;
+        }
+
+        let path_str = entry
+            .path()
+            .to_str()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dependency path contains invalid UTF-8",
+                )
+            })?
+            .strip_prefix(&directory)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dependency path does not share base prefix",
+                )
+            })?;
+        debug!("Path: {:?}", path_str);
+
+        let path_cord = Atom::from_value(slab, path_str)?.as_noun();
+        let mut contents_vec: Vec<u8> = vec![];
+        let mut file = File::open(entry.path()).await?;
+        file.read_to_end(&mut contents_vec).await?;
+        let contents = Atom::from_value(slab, contents_vec)?.as_noun();
+
+        let entry_cell = T(slab, &[path_cord, contents]);
+        directory_noun = T(slab, &[entry_cell, directory_noun]);
+    }
+
+    Ok(directory_noun)
+}
+
+fn build_native_ast_noun(
+    slab: &mut NounSlab<NockJammer>,
+    entry: &PathBuf,
+    deps_dir: &PathBuf,
+    native_asts: &HashMap<PathBuf, Vec<u8>>,
+) -> Result<Noun, Error> {
+    let entry_path = entry.canonicalize()?;
+    let entry_string = entry_path_for_hoon(entry, deps_dir)?;
+    let directory = canonicalize_and_string(deps_dir);
+
+    let entry_jam = native_asts.get(&entry_path).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("native AST missing for entry {}", entry_string),
+        )
+    })?;
+
+    let mut native_noun = D(0);
+    let mut entry_added = false;
+    for (path, jam) in native_asts {
+        let path_string = path.to_string_lossy();
+        let rel_path = match path_string.strip_prefix(&directory) {
+            Some(rel) if rel.starts_with('/') => rel.to_string(),
+            Some(rel) => format!("/{rel}"),
+            None => continue,
+        };
+
+        if rel_path == entry_string {
+            entry_added = true;
+        }
+        let path_cord = Atom::from_value(slab, rel_path)?.as_noun();
+        let hoon_noun = slab.cue_into(Bytes::from(jam.clone()))?;
+        let entry_cell = T(slab, &[path_cord, hoon_noun]);
+        native_noun = T(slab, &[entry_cell, native_noun]);
+    }
+
+    if !entry_added {
+        let entry_cord = Atom::from_value(slab, entry_string)?.as_noun();
+        let entry_hoon = slab.cue_into(Bytes::from(entry_jam.clone()))?;
+        let entry_cell = T(slab, &[entry_cord, entry_hoon]);
+        native_noun = T(slab, &[entry_cell, native_noun]);
+    }
+
+    Ok(native_noun)
+}
+
+/// Public wrapper for benchmarking the prime poke timing.
+pub async fn prime_parse_cache_public(
+    nockapp: &mut nockapp::NockApp<NockJammer>,
+    entry: &PathBuf,
+    deps_dir: &PathBuf,
+    native_asts: &HashMap<PathBuf, Vec<u8>>,
+) -> Result<(), Error> {
+    prime_parse_cache(nockapp, entry, deps_dir, native_asts).await
+}
+
+async fn prime_parse_cache(
+    nockapp: &mut nockapp::NockApp<NockJammer>,
+    entry: &PathBuf,
+    deps_dir: &PathBuf,
+    native_asts: &HashMap<PathBuf, Vec<u8>>,
+) -> Result<(), Error> {
+    let entry_string = entry_path_for_hoon(entry, deps_dir)?;
+    let entry_contents = fs::read(entry).await?;
+
+    let mut slab: NounSlab<NockJammer> = NounSlab::new();
+    let entry_path = Atom::from_value(&mut slab, entry_string)?.as_noun();
+    let entry_contents = Atom::from_value(&mut slab, entry_contents)?.as_noun();
+    let directory_noun = build_directory_noun(&mut slab, deps_dir).await?;
+    let native_noun = build_native_ast_noun(&mut slab, entry, deps_dir, native_asts)?;
+
+    let prime_poke = T(
+        &mut slab,
+        &[D(tas!(b"prime")), entry_path, entry_contents, directory_noun, native_noun],
+    );
+    slab.set_root(prime_poke);
+    nockapp.poke(OnePunchWire::Poke.to_wire(), slab).await?;
+    Ok(())
+}
+
 async fn initialize_hoonc_inner<J: Jammer + Send + 'static>(
     entry: std::path::PathBuf,
     deps_dir: std::path::PathBuf,
@@ -247,13 +416,29 @@ async fn initialize_hoonc_inner<J: Jammer + Send + 'static>(
     // Keep the prewarm tempfile alive for the duration of this function when used.
     let mut _prewarm_state_file: Option<NamedTempFile> = None;
     if should_use_prewarm {
-        let mut tmp = NamedTempFile::new()?;
-        tmp.write_all(PREWARM_STATE_JAM)?;
+        let mut tmp = NamedTempFile::new().map_err(|err| -> Error {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("prewarm tempfile create failed: {err}"),
+            ))
+        })?;
+        tmp.write_all(PREWARM_STATE_JAM).map_err(|err| -> Error {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("prewarm tempfile write failed: {err}"),
+            ))
+        })?;
         boot_cli.state_jam = Some(tmp.path().to_string_lossy().into_owned());
         _prewarm_state_file = Some(tmp);
     }
-    let mut nockapp =
-        boot::setup::<J>(KERNEL_JAM, boot_cli.clone(), &[], "hoonc", Some(data_dir)).await?;
+    let mut nockapp = boot::setup::<J>(KERNEL_JAM, boot_cli.clone(), &[], "hoonc", Some(data_dir))
+        .await
+        .map_err(|err| -> Error {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("boot setup failed: {err}"),
+            ))
+        })?;
     nockapp.add_io_driver(nockapp::file_driver()).await;
     nockapp.add_io_driver(nockapp::exit_driver()).await;
 
@@ -278,42 +463,38 @@ async fn initialize_hoonc_inner<J: Jammer + Send + 'static>(
         .await?;
     let mut slab: NounSlab<NockJammer> = NounSlab::new();
 
-    let entry_string = canonicalize_and_string(&entry);
+    let entry_string = entry_path_for_hoon(&entry, &deps_dir)?;
     let entry_path = Atom::from_value(&mut slab, entry_string)?.as_noun();
 
-    let mut directory_noun = D(0);
-    let directory = canonicalize_and_string(&deps_dir);
-
-    let walker = WalkDir::new(&directory).follow_links(true).into_iter();
-    for entry_result in walker.filter_entry(is_valid_file_or_dir) {
-        let entry = entry_result?;
-        let is_file = entry.metadata()?.is_file();
-        if is_file {
-            let path_str = entry
-                .path()
-                .to_str()
-                .expect("Failed to convert path to string")
-                .strip_prefix(&directory)
-                .expect("Failed to strip prefix");
-            debug!("Path: {:?}", path_str);
-            let path_cord = Atom::from_value(&mut slab, path_str)?.as_noun();
-
-            let contents = {
-                let mut contents_vec: Vec<u8> = vec![];
-                let mut file = File::open(entry.path()).await?;
-                file.read_to_end(&mut contents_vec).await?;
-                Atom::from_value(&mut slab, contents_vec)?.as_noun()
-            };
-
-            let entry_cell = T(&mut slab, &[path_cord, contents]);
-            directory_noun = T(&mut slab, &[entry_cell, directory_noun]);
-        }
-    }
+    let directory_noun =
+        build_directory_noun(&mut slab, &deps_dir)
+            .await
+            .map_err(|err| -> Error {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "build directory noun failed for {}: {err}",
+                        deps_dir.display()
+                    ),
+                ))
+            })?;
 
     let entry_contents = {
         let mut contents_vec: Vec<u8> = vec![];
-        let mut file = File::open(&entry).await?;
-        file.read_to_end(&mut contents_vec).await?;
+        let mut file = File::open(&entry).await.map_err(|err| -> Error {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("entry open failed for {}: {err}", entry.display()),
+            ))
+        })?;
+        file.read_to_end(&mut contents_vec)
+            .await
+            .map_err(|err| -> Error {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("entry read failed for {}: {err}", entry.display()),
+                ))
+            })?;
         Atom::from_value(&mut slab, contents_vec)?.as_noun()
     };
 
@@ -418,6 +599,21 @@ pub fn is_valid_file_or_dir(entry: &DirEntry) -> bool {
         .unwrap_or(false);
 
     is_dir || is_valid_file
+}
+
+fn entry_path_for_hoon(entry: &Path, deps_dir: &Path) -> Result<String, Error> {
+    let entry_abs = entry.canonicalize()?;
+    let deps_abs = deps_dir.canonicalize()?;
+    if let Ok(rel) = entry_abs.strip_prefix(&deps_abs) {
+        let rel_str = rel.to_string_lossy();
+        if rel_str.starts_with('/') {
+            Ok(rel_str.to_string())
+        } else {
+            Ok(format!("/{rel_str}"))
+        }
+    } else {
+        Ok(entry_abs.to_string_lossy().into_owned())
+    }
 }
 
 #[instrument]

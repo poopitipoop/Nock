@@ -387,9 +387,6 @@ pub mod util {
 
         pub fn assert_jet_door(context: &mut Context, jet: Jet, sam: Noun, pay: Noun, res: Noun) {
             let sam = T(&mut context.stack, &[D(0), sam, pay]);
-            // FIXME: This assert_no_alloc was failing the tests, but we allocate in jets
-            // all of the time, why was assert_no_alloc wrapped around the jet?
-            // let jet_res = assert_no_alloc(|| jet(context, sam).unwrap_or_else(|| panic!("Panicked at {}:{} (git sha: {:?})", file!(), line!(), option_env!("GIT_SHA"))));
             let jet_res = jet(context, sam).unwrap_or_else(|err| {
                 panic!(
                     "Panicked with {err:?} at {}:{} (git sha: {:?})",

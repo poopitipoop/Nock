@@ -16,11 +16,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static ALLOC: tracy_client::ProfiledAllocator<tikv_jemallocator::Jemalloc> =
     tracy_client::ProfiledAllocator::new(tikv_jemallocator::Jemalloc, 100);
 
-#[cfg(feature = "tracing-heap")]
-#[global_allocator]
-static ALLOC: tracy_client::ProfiledAllocator<tikv_jemallocator::Jemalloc> =
-    tracy_client::ProfiledAllocator::new(tikv_jemallocator::Jemalloc, 100);
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     nockvm::check_endian();

@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "rust/assert_no_alloc",
     "rust/ibig",
     "rust/nockvm",
     "rust/nockvm_crypto",
@@ -14,7 +13,6 @@ resolver = "2"
 ibig.path = "rust/ibig"
 nockvm_crypto.path = "rust/nockvm_crypto"
 nockvm_macros.path = "rust/nockvm_macros"
-assert_no_alloc = { path = "rust/assert_no_alloc", features = ["warn_debug"] }
 murmur3.path = "rust/murmur3"
 
 bitvec = "1.0.0"

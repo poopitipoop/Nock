@@ -1,0 +1,43 @@
+[package]
+name = "parser"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+nockvm = { workspace = true }
+nockvm_macros = { workspace = true }
+chumsky = { version = "0.10"}
+ariadne = "0.5.1"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+num-bigint = { version = "0.4.6", features = ["serde"] }
+num-traits = "0.2"
+sha2 = { workspace = true }
+bitvec = "1"
+either = "1.9.0"
+bytes = "1.5.0"
+nockapp = { workspace = true }
+hoonc = { workspace = true }
+ibig = { workspace = true }
+tokio = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+
+[[bin]]
+name = "parser"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+nockchain-math = { workspace = true }
+
+[[bench]]
+name = "kernel_build"
+harness = false

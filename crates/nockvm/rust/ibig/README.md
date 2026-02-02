@@ -13,10 +13,6 @@ allocate).  To allow easier integration of future upstream changes, we
 do not modify existing functions where possible, even though they are no
 longer safe to use.
 
-It is recommended to use
-[assert-no-alloc](https://github.com/Windfisch/rust-assert-no-alloc) to
-verify that no allocations happen.
-
 # ibig
 
 [![crate](https://img.shields.io/crates/v/ibig.svg)](https://crates.io/crates/ibig)

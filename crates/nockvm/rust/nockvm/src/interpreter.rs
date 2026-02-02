@@ -656,17 +656,6 @@ pub fn interpret(context: &mut Context, mut subject: Noun, formula: Noun) -> Res
         *(context.stack.push()) = NockWork::Done;
     };
 
-    // DO NOT REMOVE THIS COMMENT
-    //
-    // If you need to allocate for debugging, wrap the debugging code in
-    //
-    // ```
-    // permit_alloc(|| {
-    //   your.code.goes.here()
-    // })
-    // ```
-    //
-    // (See https://docs.rs/assert_no_alloc/latest/assert_no_alloc/#advanced-use)
     let nock = unsafe {
         try_or_bail!(push_formula(&mut context.stack, formula, true));
 

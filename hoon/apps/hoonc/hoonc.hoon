@@ -24,9 +24,43 @@
   $%  $:  %build
           pat=cord
           tex=cord
-          directory=(list [cord cord])
+          directory=(list [cord @])
           arbitrary=?
           out=cord
+      ==
+      $:  %parse
+          pat=cord
+          tex=cord
+          directory=(list [cord @])
+      ==
+      $:  %prime
+          pat=cord
+          tex=cord
+          directory=(list [cord @])
+          native=(list [cord *])
+      ==
+      [%file %write path=@t contents=@ success=?]
+      [%boot hoon-txt=cord]
+      [%clear ~]
+  ==
++$  cause-debug
+  $%  $:  %build
+          pat=cord
+          tex=cord
+          directory=(list [cord @])
+          arbitrary=?
+          out=cord
+      ==
+      $:  %parse
+          pat=cord
+          tex=cord
+          directory=(list [cord @])
+      ==
+      $:  %prime
+          pat=*
+          tex=*
+          directory=*
+          native=*
       ==
       [%file %write path=@t contents=@ success=?]
       [%boot hoon-txt=cord]
@@ -158,6 +192,16 @@
   ^-  [(list effect) choo-state]
   =/  cause=(unit cause)  ((soft cause) dat)
   ?~  cause
+    =/  debug=(unit cause-debug)  ((soft cause-debug) dat)
+    ?~  debug
+      =+  scratch=(debug-hoon-noun dat)
+      ~&  "hoonc: warning: input is not a proper cause"
+      !!
+    =/  debug  u.debug
+    ?:  ?=(%prime -.debug)
+      =+  scratch=(debug-prime pat.debug tex.debug directory.debug native.debug)
+      ~&  "hoonc: warning: %prime cause did not mold, dumping native entries"
+      !!
     ~&  "hoonc: warning: input is not a proper cause"
     !!
   =/  cause  u.cause
@@ -184,9 +228,9 @@
     ::
     ::  Create map of dep directory, includes target
     =/  dir
-      %-  ~(gas by *(map path cord))
+      %-  ~(gas by *(map path @))
       :-  [target-path tex.cause]
-      (turn directory.cause |=((pair @t @t) [(stab p) q]))
+      (turn directory.cause |=((pair @t @) [(stab p) q]))
     ?>  ?=(^ cached-hoon.k)
     =/  [compiled=(unit *) new-bc=build-cache new-pc=parse-cache]
       %-  ~(create builder u.cached-hoon.k bc.k pc.k)
@@ -197,6 +241,31 @@
       [%exit 1]~
     ~&  "hoonc: build succeeded, sending out write effect"
     [%file %write path=out.cause contents=(jam u.compiled)]~
+  ::
+      %parse
+    =/  target-path=path  (parse-file-path pat.cause)
+    ::
+    ::  Create map of dep directory, includes target
+    =/  dir
+      %-  ~(gas by *(map path @))
+      :-  [target-path tex.cause]
+      (turn directory.cause |=((pair @t @) [(stab p) q]))
+    =/  parse-res  (parse-dir dir)
+    =/  new-pc=parse-cache  +.parse-res
+    [~ k(pc new-pc)]
+  ::
+      %prime
+    =/  target-path=path  (parse-file-path pat.cause)
+    ::
+    ::  Create map of dep directory, includes target
+    =/  dir
+      %-  ~(gas by *(map path @))
+      :-  [target-path tex.cause]
+      (turn directory.cause |=((pair @t @) [(stab p) q]))
+    =/  native-map=(map path hoon)
+      (prime-native-map native.cause)
+    =/  new-pc=parse-cache  (prime-dir target-path dir native-map)
+    [~ k(pc new-pc)]
   ==
 --
 =>
@@ -205,6 +274,291 @@
 ::
 ~%  %dependency-system  +  ~
 |%
+::  debug helpers
+++  debug-prime
+  |=  [pat=* tex=* directory=* native=*]
+  ^-  ?
+  =/  patu  ((soft cord) pat)
+  ?~  patu
+    =+  scratch=(debug-hoon-noun pat)
+    ~&  "hoonc: prime-debug pat is not a cord"
+    %.y
+  =/  texu  ((soft cord) tex)
+  ?~  texu
+    =+  scratch=(debug-hoon-noun tex)
+    ~&  "hoonc: prime-debug tex is not a cord"
+    %.y
+  =/  listu  ((soft (list *)) directory)
+  ?~  listu
+    ~&  "hoonc: prime-debug directory is not a list"
+    %.y
+  =/  pairu  ((soft (list [* *])) directory)
+  ?~  pairu
+    ~&  "hoonc: prime-debug directory list entries are not pairs"
+    %.y
+  =/  diru  ((soft (list [cord @])) directory)
+  ?~  diru
+    =+  scratch=(debug-directory directory)
+    ~&  "hoonc: prime-debug directory is not (list [cord @])"
+    %.y
+  =+  scratch=(debug-native native)
+  scratch
+::
+++  debug-native
+  |=  native=*
+  ^-  ?
+  =/  native-mug  (mug native)
+  ~&  "hoonc: prime-debug native mug {<native-mug>}"
+  ?@  native
+    ~&  "hoonc: prime-debug native is atom"
+    %.n
+  =/  head  -.native
+  =/  tail  +.native
+  ~&  "hoonc: prime-debug native head mug {<(mug head)>}"
+  ~&  "hoonc: prime-debug native tail mug {<(mug tail)>}"
+  ?@  head
+    ~&  "hoonc: prime-debug native head is atom"
+    %.n
+  =/  path  -.head
+  =/  raw  +.head
+  ~&  "hoonc: prime-debug entry path mug {<(mug path)>}"
+  ~&  "hoonc: prime-debug entry raw mug {<(mug raw)>}"
+  =+  scratch=(debug-hoon-noun head)
+  %.n
+::
+++  debug-directory
+  |=  dir=*
+  ^-  ?
+  =/  idx=@ud  0
+  |-
+    ?@  dir
+      ?:  =(dir 0)
+        ~&  "hoonc: prime-debug directory ended after {<idx>} entries"
+        %.n
+      ~&  "hoonc: prime-debug directory tail atom {<dir>} at index {<idx>}"
+      %.y
+    =/  entry  -.dir
+    =/  rest  +.dir
+    ?@  entry
+      ~&  "hoonc: prime-debug directory entry atom at index {<idx>}"
+      %.y
+    ?:  ?=([cord @] entry)
+      $(dir rest, idx +(idx))
+    ~&  "hoonc: prime-debug directory entry {<idx>} does not mold as [cord @]"
+    ~&  "hoonc: prime-debug directory entry mug {<(mug entry)>}"
+    =/  key  -.entry
+    =/  val  +.entry
+    ?@  key
+      ?@  val
+        =/  keyu  ((soft cord) key)
+        ?~  keyu
+          ~&  "hoonc: prime-debug directory entry {<idx>} key is not cord, mug {<(mug key)>}"
+          %.y
+        ~&  "hoonc: prime-debug directory entry {<idx>} val is atom for path {<u.keyu>}"
+        %.y
+      ~&  "hoonc: prime-debug directory entry {<idx>} val is cell, mug {<(mug val)>}"
+      %.y
+    ~&  "hoonc: prime-debug directory entry {<idx>} key is cell, mug {<(mug key)>}"
+    %.y
+::
+++  debug-hoon-noun
+  |=  raw=*
+  ^-  *
+  =/  raw-mug  (mug raw)
+  ~&  "hoonc: prime-debug noun mug {<raw-mug>}"
+  ?@  raw
+    ~&  "hoonc: prime-debug noun is atom {<raw>}"
+    ~
+  =/  head  -.raw
+  =/  tail  +.raw
+  ?@  head
+    ~&  "hoonc: prime-debug head is atom"
+    =/  head-term=(unit term)  ((soft term) head)
+    ?^  head-term
+      ~&  "hoonc: prime-debug head term {<(scow %tas u.head-term)>}"
+      ?:  =(u.head-term %tssg)
+        =/  idx=@ud  0
+        =/  items  tail
+        |-
+          ?@  items
+            ?:  =(items 0)
+              ~
+            ~&  "hoonc: prime-debug tssg list tail atom {<items>} at index {<idx>}"
+            ~
+          =/  item  -.items
+          =/  rest  +.items
+          ?~  ((soft hoon) item)
+            ~&  "hoonc: prime-debug tssg item {<idx>} failed hoon mold"
+            =+  scratch=(debug-hoon-noun item)
+            ~
+          $(items rest, idx +(idx))
+      ?:  =(u.head-term %tsgr)
+        ?@  tail
+          ~&  "hoonc: prime-debug tsgr tail atom {<tail>}"
+          ~
+        =/  left  -.tail
+        =/  right  +.tail
+        =/  left-ok  ((soft hoon) left)
+        ?~  left-ok
+          ~&  "hoonc: prime-debug tsgr left failed hoon mold"
+          =+  scratch=(debug-hoon-noun left)
+          ~
+        =/  right-ok  ((soft hoon) right)
+        ?~  right-ok
+          ~&  "hoonc: prime-debug tsgr right failed hoon mold"
+          =+  scratch=(debug-hoon-noun right)
+          ~
+        ~
+      ?:  =(u.head-term %brcn)
+        ?@  tail
+          ~&  "hoonc: prime-debug brcn tail atom {<tail>}"
+          ~
+        =/  prefix  -.tail
+        =/  tomes  +.tail
+        =/  prefix-ok  ((soft (unit term)) prefix)
+        ?~  prefix-ok
+          ~&  "hoonc: prime-debug brcn prefix failed unit term"
+          ~
+        ?:  (debug-map-term-tome tomes)
+          ~&  "hoonc: prime-debug brcn tomes map failed"
+          ~
+        ~
+      ?:  =(u.head-term %dbug)
+        ?@  tail
+          ~&  "hoonc: prime-debug dbug tail atom {<tail>}"
+          ~
+        =/  spot  -.tail
+        =/  inner  +.tail
+        =/  spot-ok  ((soft spot) spot)
+        ?~  spot-ok
+          ~&  "hoonc: prime-debug dbug spot failed"
+          ~
+        =/  inner-ok  ((soft hoon) inner)
+        ?~  inner-ok
+          ~&  "hoonc: prime-debug dbug inner failed hoon mold"
+          =+  scratch=(debug-hoon-noun inner)
+          ~
+        ~
+      ~
+    ~&  "hoonc: prime-debug head atom {<head>}"
+    ~&  "hoonc: prime-debug head mug {<(mug head)>}"
+    ~&  "hoonc: prime-debug tail mug {<(mug tail)>}"
+    ~
+  ~&  "hoonc: prime-debug head is cell"
+  ~&  "hoonc: prime-debug head head mug {<(mug -.head)>}"
+  ~&  "hoonc: prime-debug head tail mug {<(mug +.head)>}"
+  ~&  "hoonc: prime-debug tail mug {<(mug tail)>}"
+  ~
+
+++  find-noun-mismatch
+  |=  [a=* b=* path=*]
+  ^-  (unit [path=* a=* b=*])
+  ?:  =(a b)
+    ~
+  ?@  a
+    [~ [path a b]]
+  ?@  b
+    [~ [path a b]]
+  =/  head=(unit [path=* a=* b=*])
+    (find-noun-mismatch -.a -.b (snoc path 0))
+  ?^  head
+    head
+  (find-noun-mismatch +.a +.b (snoc path 1))
+
+++  log-noun-mismatch
+  |=  [path=* a=* b=*]
+  ^-  *
+  ~&  "prime-diff path {<path>}"
+  ~&  "prime-diff mug a {<(mug a)>} b {<(mug b)>}"
+  ~
+
+++  strip-dbug
+  |=  gen=*
+  ^-  *
+  ?@  gen  gen
+  =/  head  -.gen
+  =/  tail  +.gen
+  ?:  ?=(%dbug head)
+    ?@  tail  gen
+    $(gen +.tail)
+  :*  $(gen head)
+      $(gen tail)
+  ==
+
+::  +debug-map-term-tome: validate map term->tome
+++  debug-map-term-tome
+  |=  map=*
+  ^-  ?
+  ?@  map
+    ?:  =(map 0)
+      %.n
+    ~&  "hoonc: prime-debug map term->tome tail atom {<map>}"
+    %.y
+  =/  node  -.map
+  =/  kids  +.map
+  ?@  node
+    ~&  "hoonc: prime-debug map term->tome node atom {<node>}"
+    %.y
+  =/  key  -.node
+  =/  val  +.node
+  =/  key-ok  ((soft term) key)
+  ?~  key-ok
+    ~&  "hoonc: prime-debug map term->tome key not term {<key>}"
+    %.y
+  ?:  (debug-tome-noun val)
+    ~&  "hoonc: prime-debug map term->tome value failed for {<(scow %tas u.key-ok)>}"
+    %.y
+  =/  left  -.kids
+  =/  right  +.kids
+  ?:  (debug-map-term-tome left)
+    %.y
+  (debug-map-term-tome right)
+::  +debug-map-term-hoon: validate map term->hoon
+++  debug-map-term-hoon
+  |=  map=*
+  ^-  ?
+  ?@  map
+    ?:  =(map 0)
+      %.n
+    ~&  "hoonc: prime-debug map term->hoon tail atom {<map>}"
+    %.y
+  =/  node  -.map
+  =/  kids  +.map
+  ?@  node
+    ~&  "hoonc: prime-debug map term->hoon node atom {<node>}"
+    %.y
+  =/  key  -.node
+  =/  val  +.node
+  =/  key-ok  ((soft term) key)
+  ?~  key-ok
+    ~&  "hoonc: prime-debug map term->hoon key not term {<key>}"
+    %.y
+  =/  val-ok  ((soft hoon) val)
+  ?~  val-ok
+    ~&  "hoonc: prime-debug map term->hoon value failed for {<(scow %tas u.key-ok)>}"
+    =+  scratch=(debug-hoon-noun val)
+    %.y
+  =/  left  -.kids
+  =/  right  +.kids
+  ?:  (debug-map-term-hoon left)
+    %.y
+  (debug-map-term-hoon right)
+::  +debug-tome-noun: validate tome structure
+++  debug-tome-noun
+  |=  raw=*
+  ^-  ?
+  ?@  raw
+    ~&  "hoonc: prime-debug tome atom {<raw>}"
+    %.y
+  =/  wot  -.raw
+  =/  arms  +.raw
+  =/  what-ok  ((soft what) wot)
+  ?~  what-ok
+    ~&  "hoonc: prime-debug tome what failed mold"
+    %.y
+  ?:  (debug-map-term-hoon arms)
+    %.y
+  %.n
 ::  +parse-file-path: parse cord of earth file path to $path
 ++  parse-file-path
   |=  pat=cord
@@ -346,7 +700,7 @@
   ~[[i.torn s] [(crip "{(trip i.torn)}-{(trip i.s)}") t.s]]
 ::
 ++  get-fit
-  |=  [pre=@ta pax=@tas dir=(map path cord)]
+  |=  [pre=@ta pax=@tas dir=(map path @)]
   ^-  (unit path)
   =/  paz=(list path)  (segments pax)
   |-
@@ -366,7 +720,7 @@
 ::
 ++  resolve-pile
   ::  turn fits into resolved path suffixes
-  |=  [=pile dir=(map path cord)]
+  |=  [=pile dir=(map path @)]
   ^-  (list raut)
   ;:  weld
     (turn sur.pile |=(taut ^-(raut [face (need (get-fit %sur pax dir))])))
@@ -425,7 +779,7 @@
 ::    returns a trap, a build-cache, and a parse-cache
 ++  create
   ~/  %create
-  |=  [tar=path dir=(map path cord) arb=?]
+  |=  [tar=path dir=(map path @) arb=?]
   ^-  [(unit (trap)) build-cache parse-cache]
   =/  dir-hash  `@uvI`(mug dir)
   ~&  >>  dir-hash+dir-hash
@@ -457,7 +811,7 @@
 ::    returns a trap with the compiled hoon/jock file and the updated caches
 ++  create-target
   ~/  %create-target
-  |=  [tar=path dir=(map path cord)]
+  |=  [tar=path dir=(map path @)]
   ^-  [(unit (trap vase)) build-cache parse-cache]
   =^  all-nodes=(map path node)  pc
     (parse-dir dir)
@@ -485,7 +839,7 @@
 ::    returns a map of nodes and the updated parse cache
 ++  parse-dir
   |^
-  |=  dir=(map path cord)
+  |=  dir=(map path @)
   ^-  [(map path node) parse-cache]
   =|  nodes=(map path node)
   =|  new-pc=parse-cache
@@ -502,9 +856,9 @@
   ==
 ::
   ++  make-node
-    |=  [pat=path dir=(map path cord) new-pc=parse-cache]
+    |=  [pat=path dir=(map path @) new-pc=parse-cache]
     ^-  [node parse-cache]
-    =/  fil=cord  (~(got by dir) pat)
+    =/  fil=@  (~(got by dir) pat)
     =/  file-hash  (shax fil)                                  ::  hash dep file
     ?.  (is-hoon pat)
       :_  new-pc
@@ -514,14 +868,27 @@
           [%octs [(met 3 fil) fil]]                     ::  octs
           %.n                                           ::  no kick
       ==
-    =/  tex=tape  (trip fil)
+    =/  fil-cord=cord  fil
+    =/  tex=tape  (trip fil-cord)
+    =/  e=(unit [path pile (list raut)])  (~(get by pc) file-hash)
+    =/  cacheable=?  %.y
     =/  [pil=pile deps=(list raut)]
-      ?~  e=(~(get by pc) file-hash)
+      ?~  e
         ~&  "parsing {<pat>}"
         (process-pile pat tex dir)
-      ~&  "reusing parse cache entry for {<pat>}"
-      [pil deps]:u.e
-    :_  (~(put by new-pc) file-hash [pat pil deps])
+      =/  old-path=path  -.u.e
+      ?:  =(pat old-path)
+        ~&  "reusing parse cache entry for {<pat>}"
+        +.u.e
+      =/  replace=?  (lth (mug pat) (mug old-path))
+      ~&  "parse-dir: hash collision {<file-hash>} new {<pat>} old {<old-path>} len {<(met 3 fil)>}"
+      =.  cacheable  replace
+      (process-pile pat tex dir)
+    =.  new-pc
+      ?:  cacheable
+        (~(put by new-pc) file-hash [pat pil deps])
+      new-pc
+    :_  new-pc
     :*  pat                                              ::  path
         file-hash                                        ::  hash
         deps                                             ::  deps
@@ -530,10 +897,118 @@
     ==
   ::
   ++  process-pile
-    |=  [pax=path tex=tape dir=(map path cord)]
+    |=  [pax=path tex=tape dir=(map path @)]
     ^-  [pile (list raut)]
     =/  pil  (parse-pile pax tex)
     [pil (resolve-pile pil dir)]
+  --
+::  $prime-native-map: validate native hoon nouns, log failures, and build map
+++  prime-native-map
+  |=  native=(list [cord *])
+  ^-  (map path hoon)
+  =|  out=(map path hoon)
+  =|  total=@ud
+  =|  bad=@ud
+  |-
+  ?~  native
+    ~&  "prime-native: ok {<(sub total bad)>} bad {<bad>} total {<total>}"
+    out
+  =.  total  +(total)
+  =/  entry=[cord *]  i.native
+  =/  path=path  (stab -.entry)
+  =/  cast=(unit hoon)  ((soft hoon) +.entry)
+  ?^  cast
+    =.  out  (~(put by out) path u.cast)
+    $(native t.native)
+  =.  bad  +(bad)
+  ~&  "prime-native: hoon mold failed for {<path>}"
+  =+  scratch=(debug-hoon-noun +.entry)
+  $(native t.native)
+::  $prime-dir: create parse-cache entries using native hoon ASTs
+::
+::    .tar: entry path to start traversal
+::    .dir: directory of deps, includes build target
+::    .native: map of hoon ASTs keyed by path
+::    returns updated parse-cache
+++  prime-dir
+  |^
+  |=  [tar=path dir=(map path @) native=(map path hoon)]
+  ^-  parse-cache
+  =|  pc=parse-cache
+  =|  seen=(set path)
+  ~&  "prime-dir: starting {<tar>}"
+  =^  pc  seen
+    (prime-node tar dir native pc seen)
+  ~&  "prime-dir: pc-size {<~(wyt by pc)>}"
+  pc
+  ::
+  ++  prime-node
+    |=  [pat=path dir=(map path @) native=(map path hoon) pc=parse-cache seen=(set path)]
+    ^-  [parse-cache (set path)]
+    ?:  (~(has in seen) pat)
+      [pc seen]
+    =.  seen  (~(put in seen) pat)
+    ?.  (is-hoon pat)
+      [pc seen]
+    =/  fil=@  (~(got by dir) pat)
+    =/  file-hash  (shax fil)
+    =/  native-hoon=(unit hoon)  (~(get by native) pat)
+    =/  e=(unit [path pile (list raut)])  (~(get by pc) file-hash)
+    =/  cacheable=?  %.y
+    =/  [pil=pile deps=(list raut)]
+      ?~  e
+        ~&  "prime-dir parsing {<pat>}"
+        =/  fil-cord=cord  fil
+        =/  tex=tape  (trip fil-cord)
+        =/  pil  (parse-pile pat tex)
+        [pil (resolve-pile pil dir)]
+      =/  old-path=path  -.u.e
+      ?:  =(pat old-path)
+        +.u.e
+      =/  replace=?  (lth (mug pat) (mug old-path))
+      ~&  "prime-dir: hash collision {<file-hash>} new {<pat>} old {<old-path>} len {<(met 3 fil)>}"
+      =.  cacheable  replace
+      =/  fil-cord=cord  fil
+      =/  tex=tape  (trip fil-cord)
+      =/  pil  (parse-pile pat tex)
+      [pil (resolve-pile pil dir)]
+    =/  pil=pile
+      ?~  native-hoon
+        pil
+      ~&  "prime-dir: injecting native hoon for {<pat>}"
+      =/  parsed-hoon  hoon.pil
+      =/  native  u.native-hoon
+      =/  parsed-clean  (strip-dbug parsed-hoon)
+      =/  native-clean  (strip-dbug native)
+      ?:  =(parsed-clean native-clean)
+        ?:  =(parsed-hoon native)
+          pil(hoon native)
+        ~&  "prime-dir: hoon spot mismatch for {<pat>}"
+        ~&  "prime-dir: using parsed hoon for {<pat>}"
+        pil(hoon parsed-hoon)
+      ~&  "prime-dir: hoon mismatch for {<pat>}"
+      =/  mismatch=(unit [path=* a=* b=*])
+        (find-noun-mismatch parsed-clean native-clean ~)
+      ?^  mismatch
+        =+  scratch=(log-noun-mismatch path.u.mismatch a.u.mismatch b.u.mismatch)
+        ~
+      ~&  "prime-dir: hoon mug parser {<(mug parsed-clean)>} native {<(mug native-clean)>}"
+      ~&  "prime-dir: parsed hoon (clean)"
+      =+  scratch=(debug-hoon-noun parsed-clean)
+      ~&  "prime-dir: native hoon (clean)"
+      =+  scratch=(debug-hoon-noun native-clean)
+      pil(hoon native)
+    =.  pc
+      ?:  cacheable
+        (~(put by pc) file-hash [pat pil deps])
+      pc
+    ~&  "prime-dir: pc-size now {<~(wyt by pc)>} for {<pat>}"
+    |-
+    ?~  deps
+      [pc seen]
+    =^  pc  seen
+      (prime-node pax.i.deps dir native pc seen)
+    $(deps t.deps, pc pc, seen seen)
   --
 ::
 ::  $build-merk-dag: builds a merkle DAG out dependencies + target
@@ -701,10 +1176,16 @@
     ~/  %compile
     |=  [nod=node dep-vaz=(trap vase)]
     ^-  (unit (trap vase))
+    =+  nod-path=path.nod
+    =+  nod-leaf=leaf.nod
     =;  result=(each (trap vase) tang)
       ?-  -.result
         %&  `p.result
-        %|  ((slog p.result) ~)
+        %|  ~&  "hoonc: compile failed for {<nod-path>}"
+            ~&  "hoonc: compile failed leaf mug {<(mug nod-leaf)>}"
+            ~&  (slog p.result)
+            ~&  (debug-hoon-noun nod-leaf)
+            ~
       ==
     %-  mule
     |.
@@ -727,12 +1208,22 @@
     =/  vaz=vase  $:swetted
     =>  vaz=vaz
     |.(vaz)
- ::
-  ++  grab
-    |=  =file-hash
-    ^-  (unit (trap vase))
-    =/  =merk-hash  (~(got by file.dag) file-hash)
-    (~(get by bc) merk-hash)
+  ::
+++  grab
+  |=  =file-hash
+  ^-  (unit (trap vase))
+  =/  merk-hash=(unit merk-hash)  (~(get by file.dag) file-hash)
+  ?~  merk-hash
+    =/  matches=(list path)
+      %+  roll
+        ~(tap by nodes)
+      |=  [[p=path n=node] acc=(list path)]
+      ?:  =(hash.n file-hash)
+        [p acc]
+      acc
+    ~&  "hoonc: grab missing file-hash {<file-hash>} file-dag-size {<~(wyt by file.dag)>} matches {<matches>}"
+    ~
+  (~(get by bc) u.merk-hash)
   --
 ::
 ::  $label-vase: label a (trap vase) with a face
@@ -801,7 +1292,14 @@
   |=  pax=path
   ^-  ?
   =/  end  (rear pax)
-  !=(~ (find ".hoon" (trip end)))
+  =/  tape  (trip end)
+  =/  ext  (trip '.hoon')
+  =/  tape-len  (lent tape)
+  =/  ext-len  (lent ext)
+  ?:  (lth tape-len ext-len)
+    %.n
+  =/  suffix  (slag (sub tape-len ext-len) tape)
+  =(suffix ext)
 ::
 ::
 ++  is-dat

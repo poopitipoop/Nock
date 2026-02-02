@@ -422,16 +422,7 @@ mod tests {
     use crate::noun::{D, T};
 
     #[test]
-    fn init() {
-        // This needs to be done because TERMINATOR is lazy allocated, and if you don't
-        // do it before you call the unit tests it'll get allocated on the Rust heap
-        // inside an assert_no_alloc block.
-        //
-        // Also Rust has no primitive for pre-test setup / post-test teardown, so we
-        // do it in a test that we rely on being called before any other in this file,
-        // since we're already using single-threaded test mode to avoid race conditions
-        // (because Rust doesn't support test order dependencies either).
-    }
+    fn init() {}
 
     #[test]
     fn test_mink_success() {

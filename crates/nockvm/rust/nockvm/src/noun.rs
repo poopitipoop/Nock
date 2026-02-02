@@ -74,9 +74,7 @@ pub const NONE: Noun = unsafe { DirectAtom::new_unchecked(tas!(b"MORMAGIC")).as_
 #[macro_export]
 macro_rules! assert_acyclic {
     ( $x:expr ) => {
-        assert_no_alloc::permit_alloc(|| {
-            assert!(crate::noun::acyclic_noun($x));
-        })
+        assert!(crate::noun::acyclic_noun($x));
     };
 }
 
@@ -118,9 +116,7 @@ fn acyclic_noun_go(noun: Noun, seen: &mut IntMap<u64, ()>) -> bool {
 #[macro_export]
 macro_rules! assert_no_forwarding_pointers {
     ( $x:expr ) => {
-        assert_no_alloc::permit_alloc(|| {
-            assert!(crate::noun::no_forwarding_pointers($x));
-        })
+        assert!(crate::noun::no_forwarding_pointers($x));
     };
 }
 

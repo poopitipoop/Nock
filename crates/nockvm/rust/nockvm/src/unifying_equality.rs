@@ -9,9 +9,7 @@ use crate::{assert_acyclic, assert_no_forwarding_pointers};
 #[macro_export]
 macro_rules! assert_no_junior_pointers {
     ( $x:expr, $y:expr ) => {
-        assert_no_alloc::permit_alloc(|| {
-            assert!($x.no_junior_pointers($y));
-        })
+        assert!($x.no_junior_pointers($y));
     };
 }
 

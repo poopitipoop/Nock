@@ -150,10 +150,14 @@ impl<J: Jammer + Send + 'static> NockApp<J> {
         NockAppError: From<E>,
     {
         // let cancel_token = tokio_util::sync::CancellationToken::new();
-        let metrics = Arc::new(
-            NockAppMetrics::register(gnort::global_metrics_registry())
-                .expect("Failed to register metrics!"),
-        );
+        let metrics = if std::env::var_os("NOCKAPP_DISABLE_METRICS").is_some() {
+            Arc::new(NockAppMetrics::noop())
+        } else {
+            Arc::new(
+                NockAppMetrics::register(gnort::global_metrics_registry())
+                    .expect("Failed to register metrics!"),
+            )
+        };
         let (saver, checkpoint) = Saver::<J>::try_load(snapshot_path, Some(metrics.clone()))
             .await
             .expect("Failed to set up snapshotting");
