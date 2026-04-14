@@ -23,6 +23,7 @@ impl Slogger for BenchSlogger {
 
 fn bench_context() -> Context {
     let mut stack = NockStack::new(8 << 20, 0);
+    let arena = stack.arena().clone();
     let cold = Cold::new(&mut stack);
     let warm = Warm::new(&mut stack);
     let hot = Hot::init(&mut stack, URBIT_HOT_STATE);
@@ -42,6 +43,7 @@ fn bench_context() -> Context {
         trace_info: None,
         running_status: cancel,
         test_jets,
+        arena,
     }
 }
 
@@ -183,7 +185,7 @@ fn bench_interpret_hint_case(c: &mut Criterion) {
                 let outcome = interpret(&mut ctx, subj, form);
                 black_box(&outcome);
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 }
@@ -228,7 +230,7 @@ fn bench_unifying_equality(c: &mut Criterion) {
                     black_box((first, second));
                 }
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 }
@@ -261,7 +263,7 @@ fn bench_cue_jam_roundtrip(c: &mut Criterion) {
                 let rejam = jam(&mut stack, decoded);
                 black_box(rejam);
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 }
@@ -285,7 +287,7 @@ fn bench_warm_lookup(c: &mut Criterion) {
                 let miss = warm.find_jet(&mut ctx.stack, &mut subject, &mut bogus_formula);
                 black_box((hit, miss));
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 }
@@ -320,7 +322,7 @@ fn bench_cache_churn(c: &mut Criterion) {
                 ctx.cache = cache;
                 black_box(ctx.cache.is_null());
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 }

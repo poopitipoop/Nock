@@ -23,14 +23,12 @@ use libp2p::{
 };
 use nockapp::driver::{IODriverFn, PokeResult};
 use nockapp::noun::slab::NounSlab;
-use nockapp::noun::FromAtom;
 use nockapp::utils::error::{CrownError, ExternalError};
 use nockapp::utils::make_tas;
 use nockapp::utils::scry::*;
 use nockapp::wire::{Wire, WireRepr};
 use nockapp::{AtomExt, NockAppError};
-use nockvm::ext::NounExt;
-use nockvm::noun::{Atom, Noun, D, T};
+use nockvm::noun::{Atom, Noun, NounAllocator, NounSpace, D, T};
 use nockvm_macros::tas;
 use rand::rng;
 use rand::seq::SliceRandom;
@@ -109,12 +107,14 @@ impl EffectType {
             return EffectType::Unknown;
         };
 
-        let head = effect_cell.head();
-        let Ok(atom) = head.as_atom() else {
+        let space = noun_slab.noun_space();
+        let effect_cell = effect_cell.in_space(&space);
+        let head = effect_cell.head().noun();
+        let Ok(atom) = head.in_space(&space).as_atom() else {
             return EffectType::Unknown;
         };
         let Ok(bytes) = atom.to_bytes_until_nul() else {
-            warn!("atom was not properly formatted: {:?}", atom);
+            warn!("atom was not properly formatted: {:?}", atom.atom());
             return EffectType::Unknown;
         };
 
@@ -492,25 +492,41 @@ async fn handle_effect(
 ) -> Result<(), NockAppError> {
     match EffectType::from_noun_slab(&noun_slab) {
         EffectType::Gossip => {
-            // Get the tail of the gossip effect (after %gossip head)
-            let mut tail_slab = NounSlab::new();
-            let gossip_cell = unsafe { noun_slab.root().as_cell()?.tail() };
+            let (tail_slab, is_heard_block) = {
+                // Get the tail of the gossip effect (after %gossip head)
+                let mut tail_slab = NounSlab::new();
+                let space = noun_slab.noun_space();
+                let gossip_cell = unsafe { *noun_slab.root() }
+                    .in_space(&space)
+                    .as_cell()?
+                    .tail()
+                    .noun();
 
-            // Skip version number
-            // TODO: add version negotiation, reject unknown/incompatible versions
-            let data_cell = gossip_cell.as_cell()?.tail();
-            tail_slab.copy_into(data_cell);
+                // Skip version number
+                // TODO: add version negotiation, reject unknown/incompatible versions
+                let data_cell = gossip_cell.in_space(&space).as_cell()?.tail().noun();
+                tail_slab.copy_into(data_cell, &space);
 
-            // Check if this is a heard-block gossip
-            let gossip_noun = unsafe { tail_slab.root() };
-            if let Ok(data_cell) = gossip_noun.as_cell() {
-                if data_cell.head().eq_bytes(b"heard-block") {
-                    trace!("Gossip effect for heard-block, clearing block and elders cache");
-                    let mut state_guard = driver_state.lock().await;
-                    state_guard.block_cache.clear();
-                    state_guard.elders_cache.clear();
-                    state_guard.elders_negative_cache.clear();
-                }
+                // Check if this is a heard-block gossip
+                let is_heard_block = {
+                    let tail_space = tail_slab.noun_space();
+                    let gossip_noun = unsafe { *tail_slab.root() };
+                    if let Ok(data_cell) = gossip_noun.in_space(&tail_space).as_cell() {
+                        data_cell.head().eq_bytes(b"heard-block")
+                    } else {
+                        false
+                    }
+                };
+
+                (tail_slab, is_heard_block)
+            };
+
+            if is_heard_block {
+                trace!("Gossip effect for heard-block, clearing block and elders cache");
+                let mut state_guard = driver_state.lock().await;
+                state_guard.block_cache.clear();
+                state_guard.elders_cache.clear();
+                state_guard.elders_negative_cache.clear();
             }
 
             let gossip_request = NockchainRequest::new_gossip(&tail_slab);
@@ -529,47 +545,66 @@ async fn handle_effect(
             }
         }
         EffectType::Request => {
-            // Extract request details to check if it's a peer-specific request
-            let request_cell = unsafe { noun_slab.root().as_cell()? };
-            let request_body = request_cell.tail().as_cell()?;
-            let request_type = request_body.head().as_direct()?;
+            let (target_peers, is_limited_request, raw_tx_id) = {
+                let space = noun_slab.noun_space();
+                // Extract request details to check if it's a peer-specific request
+                let request_cell = unsafe { *noun_slab.root() }.in_space(&space).as_cell()?;
+                let request_body = request_cell.tail().as_cell()?;
+                let request_type = request_body.head().noun().as_direct()?;
 
-            let mut is_limited_request = false;
+                let mut is_limited_request = false;
+                let request_tag = request_type.data();
 
-            let target_peers = if request_type.data() == tas!(b"block") {
-                let block_cell = request_body.tail().as_cell()?;
-                if block_cell.head().eq_bytes(b"elders") {
-                    // Extract peer ID from elders request
-                    let elders_cell = block_cell.tail().as_cell()?;
-                    let peer_id_atom = elders_cell.tail().as_atom()?;
-                    if let Ok(bytes) = peer_id_atom.to_bytes_until_nul() {
-                        if let Ok(peer_id) = PeerId::from_bytes(&bytes) {
-                            vec![peer_id]
+                let target_peers = if request_tag == tas!(b"block") {
+                    let block_cell = request_body.tail().as_cell()?;
+                    if block_cell.head().eq_bytes(b"elders") {
+                        // Extract peer ID from elders request
+                        let elders_cell = block_cell.tail().as_cell()?;
+                        let peer_id_atom = elders_cell.tail().as_atom()?;
+                        if let Ok(bytes) = peer_id_atom.to_bytes_until_nul() {
+                            if let Ok(peer_id) = PeerId::from_bytes(&bytes) {
+                                vec![peer_id]
+                            } else {
+                                is_limited_request = fast_sync;
+                                connected_peers.clone()
+                            }
                         } else {
                             is_limited_request = fast_sync;
                             connected_peers.clone()
                         }
                     } else {
-                        is_limited_request = fast_sync;
                         connected_peers.clone()
                     }
                 } else {
                     connected_peers.clone()
-                }
-            } else {
-                connected_peers.clone()
-            };
+                };
 
-            if request_type.data() == tas!(b"raw-tx") {
-                if let Ok(raw_tx_cell) = request_body.tail().as_cell() {
-                    if raw_tx_cell.head().eq_bytes(b"by-id") {
-                        is_limited_request = fast_sync;
-                        trace!("Requesting raw transaction by ID, removing ID from seen set");
-                        let tx_id = tip5_hash_to_base58_stack(&mut noun_slab, raw_tx_cell.tail())?;
-                        let mut state_guard = driver_state.clone().lock_owned().await;
-                        state_guard.seen_txs.remove(&tx_id);
+                let raw_tx_id = if request_tag == tas!(b"raw-tx") {
+                    if let Ok(raw_tx_cell) = request_body.tail().as_cell() {
+                        if raw_tx_cell.head().eq_bytes(b"by-id") {
+                            is_limited_request = fast_sync;
+                            trace!("Requesting raw transaction by ID, removing ID from seen set");
+                            Some(tip5_hash_to_base58_stack(
+                                &mut noun_slab,
+                                raw_tx_cell.tail().noun(),
+                                &space,
+                            )?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    None
+                };
+
+                Ok::<_, NockAppError>((target_peers, is_limited_request, raw_tx_id))
+            }?;
+
+            if let Some(tx_id) = raw_tx_id {
+                let mut state_guard = driver_state.clone().lock_owned().await;
+                state_guard.seen_txs.remove(&tx_id);
             }
 
             let request_peers: Vec<_> = if is_limited_request {
@@ -599,29 +634,40 @@ async fn handle_effect(
             }
         }
         EffectType::LiarPeer => {
-            let effect_cell = unsafe { noun_slab.root().as_cell()? };
-            let liar_peer_cell = effect_cell.tail().as_cell().map_err(|_| {
-                NockAppError::IoError(std::io::Error::other(
-                    "Expected peer ID cell in liar-peer effect",
-                ))
-            })?;
-            let peer_id_atom = liar_peer_cell.head().as_atom().map_err(|_| {
-                NockAppError::IoError(std::io::Error::other(
-                    "Expected peer ID atom in liar-peer effect",
-                ))
-            })?;
+            let peer_id = {
+                let space = noun_slab.noun_space();
+                let effect_cell = unsafe { *noun_slab.root() }.in_space(&space).as_cell()?;
+                let liar_peer_cell = effect_cell.tail().as_cell().map_err(|_| {
+                    NockAppError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Expected peer ID cell in liar-peer effect",
+                    ))
+                })?;
+                let peer_id_atom = liar_peer_cell.head().as_atom().map_err(|_| {
+                    NockAppError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Expected peer ID atom in liar-peer effect",
+                    ))
+                })?;
 
-            let bytes = peer_id_atom
-                .to_bytes_until_nul()
-                .expect("failed to strip null bytes");
+                let bytes = peer_id_atom
+                    .to_bytes_until_nul()
+                    .expect("failed to strip null bytes");
 
-            let peer_id_str = String::from_utf8(bytes).map_err(|_| {
-                NockAppError::IoError(std::io::Error::other("Invalid UTF-8 in peer ID"))
-            })?;
+                let peer_id_str = String::from_utf8(bytes).map_err(|_| {
+                    NockAppError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Invalid UTF-8 in peer ID",
+                    ))
+                })?;
 
-            let peer_id = PeerId::from_str(&peer_id_str).map_err(|_| {
-                NockAppError::IoError(std::io::Error::other("Invalid peer ID format"))
-            })?;
+                PeerId::from_str(&peer_id_str).map_err(|_| {
+                    NockAppError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Invalid peer ID format",
+                    ))
+                })?
+            };
 
             swarm_tx
                 .send(SwarmAction::BlockPeer { peer_id })
@@ -631,18 +677,25 @@ async fn handle_effect(
                 })?;
         }
         EffectType::LiarBlockId => {
-            let effect_cell = unsafe { noun_slab.root().as_cell()? };
-            let liar_block_cell = effect_cell.tail().as_cell().map_err(|_| {
-                NockAppError::IoError(std::io::Error::other(
-                    "Expected block ID cell in liar-block-id effect",
-                ))
-            })?;
+            let block_id = {
+                let space = noun_slab.noun_space();
+                let effect_cell = unsafe { *noun_slab.root() }.in_space(&space).as_cell()?;
+                let liar_block_cell = effect_cell.tail().as_cell().map_err(|_| {
+                    NockAppError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Expected block ID cell in liar-block-id effect",
+                    ))
+                })?;
 
-            let block_id = liar_block_cell.head();
+                liar_block_cell.head().noun()
+            };
 
             // Add the bad block ID
             let mut state_guard = driver_state.lock().await;
-            let peers_to_ban = state_guard.process_bad_block_id(block_id)?;
+            let peers_to_ban = {
+                let space = noun_slab.noun_space();
+                state_guard.process_bad_block_id(block_id, &space)?
+            };
 
             // Ban each peer that sent this block
             for peer_id in peers_to_ban {
@@ -655,82 +708,132 @@ async fn handle_effect(
             }
         }
         EffectType::Track => {
-            let effect_cell = unsafe { noun_slab.root().as_cell()? };
-            let track_cell = effect_cell.tail().as_cell()?;
-            let action = track_cell.head();
+            enum TrackAction {
+                Add { block_id: Noun, peer_id: PeerId },
+                Remove { block_id: Noun },
+            }
 
-            if action.eq_bytes(b"add") {
-                // Handle [%track %add block-id peer-id]
-                let data_cell = track_cell.tail().as_cell()?;
-                let block_id = data_cell.head();
-                let peer_id_atom = data_cell.tail().as_atom()?;
+            let track_action = {
+                let space = noun_slab.noun_space();
+                let effect_cell = unsafe { *noun_slab.root() }.in_space(&space).as_cell()?;
+                let track_cell = effect_cell.tail().as_cell()?;
+                let action = track_cell.head();
 
-                // Convert peer_id from base58 string to PeerId
-                let Ok(peer_id) = PeerId::from_noun(peer_id_atom.as_noun()) else {
-                    return Err(NockAppError::OtherError(String::from(
-                        "Invalid peer ID format",
-                    )));
-                };
+                if action.eq_bytes(b"add") {
+                    // Handle [%track %add block-id peer-id]
+                    let data_cell = track_cell.tail().as_cell()?;
+                    let block_id = data_cell.head().noun();
+                    let peer_id_atom = data_cell.tail().as_atom()?;
 
-                // Add to message tracker
-                let mut state_guard = driver_state.lock().await;
-                state_guard.track_block_id_and_peer(block_id, peer_id)?;
-            } else if action.eq_bytes(b"remove") {
-                // Handle [%track %remove block-id]
-                let block_id = track_cell.tail();
+                    // Convert peer_id from base58 string to PeerId
+                    let Ok(peer_id) = PeerId::from_noun(peer_id_atom.atom().as_noun(), &space)
+                    else {
+                        return Err(NockAppError::OtherError(String::from(
+                            "Invalid peer ID format",
+                        )));
+                    };
 
-                // Remove from message tracker
-                let mut state_guard = driver_state.lock().await;
-                state_guard.remove_block_id(block_id)?;
-            } else {
-                return Err(NockAppError::IoError(std::io::Error::other(
-                    "Invalid track action",
-                )));
+                    Ok(TrackAction::Add { block_id, peer_id })
+                } else if action.eq_bytes(b"remove") {
+                    // Handle [%track %remove block-id]
+                    let block_id = track_cell.tail().noun();
+                    Ok(TrackAction::Remove { block_id })
+                } else {
+                    Err(NockAppError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Invalid track action",
+                    )))
+                }
+            }?;
+
+            match track_action {
+                TrackAction::Add { block_id, peer_id } => {
+                    // Add to message tracker
+                    let mut state_guard = driver_state.lock().await;
+                    let space = noun_slab.noun_space();
+                    state_guard.track_block_id_and_peer(block_id, peer_id, &space)?;
+                }
+                TrackAction::Remove { block_id } => {
+                    // Remove from message tracker
+                    let mut state_guard = driver_state.lock().await;
+                    let space = noun_slab.noun_space();
+                    state_guard.remove_block_id(block_id, &space)?;
+                }
             }
         }
         EffectType::Seen => {
-            let effect_cell = unsafe { noun_slab.root().as_cell()? };
-            let seen_cell = effect_cell.tail().as_cell()?;
-            let seen_type = seen_cell.head();
+            enum SeenAction {
+                Block { id: String, height: Option<u64> },
+                Tx { id: String },
+                Unknown,
+            }
 
-            if seen_type.eq_bytes(b"block") {
-                let seen_pq = seen_cell.tail().as_cell()?;
-                let block_id = seen_pq.head().as_cell()?;
-                let mut state_guard = driver_state.lock().await;
-                let block_id_str = tip5_hash_to_base58_stack(&mut noun_slab, block_id.as_noun())
-                    .expect("failed to convert block ID to base58");
-                trace!("seen block id: {:?}", &block_id_str);
-                state_guard.seen_blocks.insert(block_id_str);
+            let seen_action = {
+                let space = noun_slab.noun_space();
+                let effect_cell = unsafe { *noun_slab.root() }.in_space(&space).as_cell()?;
+                let seen_cell = effect_cell.tail().as_cell()?;
+                let seen_type = seen_cell.head();
 
-                if let Ok(block_height_unit_cell) = seen_pq.tail().as_cell() {
-                    let block_height = block_height_unit_cell.tail().as_atom()?.as_u64()?;
-                    if state_guard.first_negative <= block_height {
-                        metrics.highest_block_height_seen.swap(block_height as f64);
-                        state_guard.first_negative = block_height + 1;
-                        trace!(
-                            "Setting state_guard.first_negative to {:?}",
-                            state_guard.first_negative
-                        );
+                if seen_type.eq_bytes(b"block") {
+                    let seen_pq = seen_cell.tail().as_cell()?;
+                    let block_id = seen_pq.head().noun();
+                    let block_id_str = tip5_hash_to_base58_stack(&mut noun_slab, block_id, &space)
+                        .expect("failed to convert block ID to base58");
+                    let block_height = if let Ok(block_height_unit_cell) = seen_pq.tail().as_cell()
+                    {
+                        Some(block_height_unit_cell.tail().as_atom()?.as_u64()?)
+                    } else {
+                        None
+                    };
+                    SeenAction::Block {
+                        id: block_id_str,
+                        height: block_height,
+                    }
+                } else if seen_type.eq_bytes(b"tx") {
+                    let tx_id = seen_cell.tail().as_cell()?;
+                    let tx_id_str =
+                        tip5_hash_to_base58_stack(&mut noun_slab, tx_id.cell().as_noun(), &space)
+                            .expect("failed to convert tx ID to base58");
+                    SeenAction::Tx { id: tx_id_str }
+                } else {
+                    SeenAction::Unknown
+                }
+            };
 
-                        // Check if we should clear the tx cache
-                        if block_height
-                            >= state_guard.last_tx_cache_clear_height
-                                + state_guard.seen_tx_clear_interval
-                        {
-                            debug!("Clearing seen_txs cache at block height {}", block_height);
-                            debug!("Cache before clearing: {:?}", state_guard.seen_txs);
-                            state_guard.seen_txs.clear();
-                            state_guard.last_tx_cache_clear_height = block_height;
+            match seen_action {
+                SeenAction::Block { id, height } => {
+                    let mut state_guard = driver_state.lock().await;
+                    trace!("seen block id: {:?}", &id);
+                    state_guard.seen_blocks.insert(id);
+
+                    if let Some(block_height) = height {
+                        if state_guard.first_negative <= block_height {
+                            metrics.highest_block_height_seen.swap(block_height as f64);
+                            state_guard.first_negative = block_height + 1;
+                            trace!(
+                                "Setting state_guard.first_negative to {:?}",
+                                state_guard.first_negative
+                            );
+
+                            // Check if we should clear the tx cache
+                            if block_height
+                                >= state_guard.last_tx_cache_clear_height
+                                    + state_guard.seen_tx_clear_interval
+                            {
+                                debug!("Clearing seen_txs cache at block height {}", block_height);
+                                debug!("Cache before clearing: {:?}", state_guard.seen_txs);
+                                state_guard.seen_txs.clear();
+                                state_guard.last_tx_cache_clear_height = block_height;
+                            }
                         }
                     }
                 }
-            } else if seen_type.eq_bytes(b"tx") {
-                let tx_id = seen_cell.tail().as_cell()?;
-                let mut state_guard = driver_state.lock().await;
-                let tx_id_str = tip5_hash_to_base58_stack(&mut noun_slab, tx_id.as_noun())
-                    .expect("failed to convert tx ID to base58");
-                trace!("seen tx id: {:?}", &tx_id_str);
-                state_guard.seen_txs.insert(tx_id_str);
+                SeenAction::Tx { id } => {
+                    let mut state_guard = driver_state.lock().await;
+                    trace!("seen tx id: {:?}", &id);
+                    state_guard.seen_txs.insert(id);
+                }
+                SeenAction::Unknown => {}
             }
         }
         EffectType::Unknown => {
@@ -800,7 +903,10 @@ async fn handle_request_response(
                     let message_bytes = Bytes::from(message.to_vec());
                     let request_noun = request_slab.cue_into(message_bytes)?;
 
-                    let data_request = NockchainDataRequest::from_noun(request_noun)?;
+                    let data_request = {
+                        let space = request_slab.noun_space();
+                        NockchainDataRequest::from_noun(request_noun, &space)?
+                    };
 
                     let cached = {
                         let cache_result = {
@@ -850,11 +956,20 @@ async fn handle_request_response(
                             }
                             Ok(None) => {
                                 metrics.requests_peeked_none.increment();
+                                let request_type = {
+                                    let space = request_slab.noun_space();
+                                    request_noun
+                                        .in_space(&space)
+                                        .as_cell()
+                                        .ok()
+                                        .and_then(|cell| cell.tail().as_cell().ok())
+                                        .map(|cell| cell.head().noun())
+                                };
                                 trace!(
-                                "No data found for incoming request from: {}, request type: {:?}",
-                                peer,
-                                request_noun.as_cell()?.tail().as_cell().map(|c| c.head())
-                            );
+                                    "No data found for incoming request from: {}, request type: {:?}",
+                                    peer,
+                                    request_type
+                                );
                                 None
                             }
                             Err(NockAppError::MPSCFullError(act)) => {
@@ -906,7 +1021,12 @@ async fn handle_request_response(
                     let response = match data_request {
                         NockchainDataRequest::BlockByHeight(height) => {
                             let scry_res = unsafe { scry_res_slab.root() };
-                            match create_scry_response(scry_res, "heard-block", &mut res_slab) {
+                            match {
+                                let scry_space = scry_res_slab.noun_space();
+                                create_scry_response(
+                                    scry_res, &scry_space, "heard-block", &mut res_slab,
+                                )
+                            } {
                                 Left(()) => {
                                     trace!("No data found for incoming block by-height request");
                                     NockchainResponse::Ack { acked: true }
@@ -924,7 +1044,12 @@ async fn handle_request_response(
                         }
                         NockchainDataRequest::EldersById(id, _, _) => {
                             let scry_res = unsafe { scry_res_slab.root() };
-                            match create_scry_response(scry_res, "heard-elders", &mut res_slab) {
+                            match {
+                                let scry_space = scry_res_slab.noun_space();
+                                create_scry_response(
+                                    scry_res, &scry_space, "heard-elders", &mut res_slab,
+                                )
+                            } {
                                 Left(()) => {
                                     trace!("No data found for incoming elders request");
                                     let mut state_guard = driver_state.lock().await;
@@ -942,7 +1067,12 @@ async fn handle_request_response(
                         }
                         NockchainDataRequest::RawTransactionById(ref id, _) => {
                             let scry_res = unsafe { scry_res_slab.root() };
-                            match create_scry_response(scry_res, "heard-tx", &mut res_slab) {
+                            match {
+                                let scry_space = scry_res_slab.noun_space();
+                                create_scry_response(
+                                    scry_res, &scry_space, "heard-tx", &mut res_slab,
+                                )
+                            } {
                                 Left(()) => {
                                     trace!("No data found for incoming raw-tx request");
                                     NockchainResponse::Ack { acked: true }
@@ -1036,11 +1166,17 @@ async fn handle_request_response(
 
                         let wire = Libp2pWire::Gossip(peer);
 
-                        trace!(
-                            "Poking kernel with wire: {:?} noun: {:?}",
-                            wire,
-                            nockvm::noun::FullDebugCell(unsafe { &request_slab.root().as_cell()? })
-                        );
+                        {
+                            let space = request_slab.noun_space();
+                            trace!(
+                                "Poking kernel with wire: {:?} noun: {:?}",
+                                wire,
+                                nockvm::noun::FullDebugCell {
+                                    cell: unsafe { &request_slab.root().as_cell()? },
+                                    space: &space,
+                                }
+                            );
+                        }
 
                         let poke = gossip.fact_poke();
                         let (timing, timing_rx) = tokio::sync::oneshot::channel();
@@ -1147,10 +1283,16 @@ async fn handle_request_response(
                 let response_noun = response_slab.cue_into(message_bytes)?;
                 response_slab.set_root(response_noun);
 
-                trace!(
-                    "Response noun: {:?}",
-                    nockvm::noun::FullDebugCell(&response_noun.as_cell()?)
-                );
+                {
+                    let trace_space = response_slab.noun_space();
+                    trace!(
+                        "Response noun: {:?}",
+                        nockvm::noun::FullDebugCell {
+                            cell: &response_noun.as_cell()?,
+                            space: &trace_space,
+                        }
+                    );
+                }
 
                 let response = NockchainFact::from_noun_slab(&mut response_slab)?;
                 let response_cell = unsafe { response_slab.root().as_cell() }?;
@@ -1219,11 +1361,20 @@ async fn handle_request_response(
                     .await;
                 let elapsed = timing_rx.await?;
 
-                if response_cell.head().eq_bytes(b"heard-block") {
+                let space = response_slab.noun_space();
+                if response_cell
+                    .in_space(&space)
+                    .head()
+                    .eq_bytes(b"heard-block")
+                {
                     metrics.heard_block_poke_time.add_timing(&elapsed);
-                } else if response_cell.head().eq_bytes(b"heard-tx") {
+                } else if response_cell.in_space(&space).head().eq_bytes(b"heard-tx") {
                     metrics.heard_tx_poke_time.add_timing(&elapsed);
-                } else if response_cell.head().eq_bytes(b"heard-elders") {
+                } else if response_cell
+                    .in_space(&space)
+                    .head()
+                    .eq_bytes(b"heard-elders")
+                {
                     metrics.heard_elders_poke_time.add_timing(&elapsed);
                 }
 
@@ -1378,7 +1529,7 @@ fn request_to_scry_slab(request: NockchainDataRequest) -> Result<NounSlab, NockA
         NockchainDataRequest::BlockByHeight(height) => {
             debug!("Requesting block by height: {}", height);
             let mut slab = NounSlab::new();
-            let height_atom = Noun::from_atom(Atom::new(&mut slab, height));
+            let height_atom = Atom::new(&mut slab, height).as_noun();
             let noun = T(&mut slab, &[D(tas!(b"heavy-n")), height_atom, D(0)]);
             slab.set_root(noun);
             Ok(slab)
@@ -1417,10 +1568,11 @@ fn request_to_scry_slab(request: NockchainDataRequest) -> Result<NounSlab, NockA
 /// - `Right(Err(NockAppError))` if there was an error processing the result
 fn create_scry_response(
     scry_res: &Noun,
+    space: &NounSpace,
     heard_type: &str,
     res_slab: &mut NounSlab,
 ) -> Either<(), Result<NockchainResponse, NockAppError>> {
-    match ScryResult::from(scry_res) {
+    match ScryResult::from_noun(scry_res, space) {
         ScryResult::BadPath => {
             warn!("Bad scry path");
             Left(())
@@ -1430,7 +1582,8 @@ fn create_scry_response(
             Left(())
         }
         ScryResult::Some(x) => {
-            let nouns = vec![x];
+            let imported = res_slab.copy_into(x.noun(), x.space());
+            let nouns = vec![imported];
             if let Ok(response_noun) = prepend_tas(res_slab, heard_type, nouns) {
                 res_slab.set_root(response_noun);
                 Right(Ok(NockchainResponse::new_response_result(res_slab.jam())))
@@ -1579,13 +1732,18 @@ mod tests {
     use std::sync::LazyLock;
 
     use nockapp::noun::slab::NounSlab;
-    use nockvm::noun::{D, T};
+    use nockvm::mem::NockStack;
+    use nockvm::noun::{NounAllocator, D, T};
     use nockvm_macros::tas;
     use serde_bytes::ByteBuf;
 
     use super::*;
 
     pub static LIBP2P_CONFIG: LazyLock<LibP2PConfig> = LazyLock::new(LibP2PConfig::default);
+
+    fn install_test_arena() -> NockStack {
+        NockStack::new(1 << 16, 0)
+    }
 
     #[test]
     #[cfg_attr(miri, ignore)] // ibig has a memory leak so miri fails this test
@@ -1600,7 +1758,8 @@ mod tests {
             let request = T(&mut slab, &[D(tas!(b"request")), block_cell]);
             slab.set_root(request);
 
-            let data_request = NockchainDataRequest::from_noun(request)
+            let space = slab.noun_space();
+            let data_request = NockchainDataRequest::from_noun(request, &space)
                 .expect("Failed to create request from noun");
 
             let result_slab = request_to_scry_slab(data_request).unwrap_or_else(|_| {
@@ -1612,6 +1771,7 @@ mod tests {
                 )
             });
             let result = unsafe { result_slab.root() };
+            let result_space = result_slab.noun_space();
 
             assert!(result.is_cell());
             let result_cell = result.as_cell().unwrap_or_else(|_| {
@@ -1622,6 +1782,7 @@ mod tests {
                     option_env!("GIT_SHA").unwrap_or("unknown")
                 )
             });
+            let result_cell = result_cell.in_space(&result_space);
             assert!(result_cell.head().eq_bytes(b"heavy-n"));
 
             // Get the tail cell and check its components
@@ -1661,14 +1822,18 @@ mod tests {
                 )
             });
             assert_eq!(
-                tail_atom.as_u64().unwrap_or_else(|err| {
-                    panic!(
-                        "Panicked with {err:?} at {}:{} (git sha: {:?})",
-                        file!(),
-                        line!(),
-                        option_env!("GIT_SHA")
-                    )
-                }),
+                tail_atom
+                    .atom()
+                    .as_direct()
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "Panicked with {err:?} at {}:{} (git sha: {:?})",
+                            file!(),
+                            line!(),
+                            option_env!("GIT_SHA")
+                        )
+                    })
+                    .data(),
                 0
             );
         }
@@ -1677,7 +1842,8 @@ mod tests {
         {
             let mut slab: NounSlab = NounSlab::new();
             slab.set_root(D(123));
-            let result = NockchainDataRequest::from_noun(*unsafe { slab.root() })
+            let space = slab.noun_space();
+            let result = NockchainDataRequest::from_noun(*unsafe { slab.root() }, &space)
                 .and_then(request_to_scry_slab);
             assert!(result.is_err());
         }
@@ -1699,7 +1865,8 @@ mod tests {
             let request = T(&mut slab, &[D(tas!(b"request")), block_cell]);
             slab.set_root(request);
 
-            let data_request = NockchainDataRequest::from_noun(request)
+            let space = slab.noun_space();
+            let data_request = NockchainDataRequest::from_noun(request, &space)
                 .expect("Could not create request from noun");
 
             let result_slab = request_to_scry_slab(data_request).unwrap_or_else(|_| {
@@ -1711,6 +1878,7 @@ mod tests {
                 )
             });
             let result = unsafe { result_slab.root() };
+            let result_space = result_slab.noun_space();
 
             // Verify the structure: [%elders block_id_b58 0]
             assert!(result.is_cell());
@@ -1724,6 +1892,7 @@ mod tests {
             });
 
             // Check %elders tag
+            let result_cell = result_cell.in_space(&result_space);
             assert!(result_cell.head().eq_bytes(b"elders"));
 
             // Get the tail cell
@@ -1763,7 +1932,7 @@ mod tests {
             });
 
             // Get the expected base58 string
-            let expected_b58 = tip5_hash_to_base58(five_tuple).unwrap_or_else(|_| {
+            let expected_b58 = tip5_hash_to_base58(five_tuple, &space).unwrap_or_else(|_| {
                 panic!(
                     "Called `expect()` at {}:{} (git sha: {})",
                     file!(),
@@ -1774,9 +1943,17 @@ mod tests {
             assert_eq!(block_id_str, expected_b58);
 
             // Check final 0
+            let tail_atom = tail_cell.tail().as_atom().unwrap_or_else(|_| {
+                panic!(
+                    "Called `expect()` at {}:{} (git sha: {})",
+                    file!(),
+                    line!(),
+                    option_env!("GIT_SHA").unwrap_or("unknown")
+                )
+            });
             assert_eq!(
-                tail_cell
-                    .tail()
+                tail_atom
+                    .atom()
                     .as_direct()
                     .unwrap_or_else(|err| {
                         panic!(
@@ -1800,16 +1977,80 @@ mod tests {
             );
             slab.set_root(invalid_request);
 
-            let result =
-                NockchainDataRequest::from_noun(invalid_request).and_then(request_to_scry_slab);
+            let space = slab.noun_space();
+            let result = NockchainDataRequest::from_noun(invalid_request, &space)
+                .and_then(request_to_scry_slab);
             assert!(result.is_err());
             drop(slab);
         }
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "memfd_create unsupported in Miri")]
+    fn test_create_scry_response_wraps_peek_payload_in_response() {
+        let mut scry_res_slab: NounSlab = NounSlab::new();
+        let payload = T(&mut scry_res_slab, &[D(1), D(2)]);
+        let scry_result = T(&mut scry_res_slab, &[D(0), D(0), payload]);
+        scry_res_slab.set_root(scry_result);
+
+        let scry_space = scry_res_slab.noun_space();
+        match ScryResult::from_noun(unsafe { scry_res_slab.root() }, &scry_space) {
+            ScryResult::Some(found) => {
+                assert!(unsafe { found.noun().raw_equals(&payload) });
+            }
+            _ => panic!("expected Some(payload) scry result"),
+        }
+
+        let mut res_slab = NounSlab::new();
+        let response = create_scry_response(
+            unsafe { scry_res_slab.root() },
+            &scry_space,
+            "heard-block",
+            &mut res_slab,
+        );
+        let Right(Ok(NockchainResponse::Result { message })) = response else {
+            panic!("expected a successful response result");
+        };
+
+        let mut decoded_slab: NounSlab = NounSlab::new();
+        decoded_slab
+            .cue_into(message.into_vec().into())
+            .expect("response jam should decode");
+        let decoded_space = decoded_slab.noun_space();
+        let response_cell = unsafe { decoded_slab.root() }
+            .in_space(&decoded_space)
+            .as_cell()
+            .expect("response root should be a cell");
+        assert!(response_cell.head().eq_bytes(b"heard-block"));
+
+        let payload_cell = response_cell
+            .tail()
+            .as_cell()
+            .expect("heard-block payload should be a cell");
+        assert_eq!(
+            payload_cell
+                .head()
+                .as_atom()
+                .expect("payload head should be an atom")
+                .as_u64()
+                .expect("payload head should fit in u64"),
+            1
+        );
+        assert_eq!(
+            payload_cell
+                .tail()
+                .as_atom()
+                .expect("payload tail should be an atom")
+                .as_u64()
+                .expect("payload tail should fit in u64"),
+            2
+        );
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore)] // equix uses a foreign function so miri fails this tes
     fn test_equix_pow_verification() {
+        let _arena = install_test_arena();
         use equix::EquiXBuilder;
         // Create EquiX builder - new() doesn't return Result
         let mut builder = EquiXBuilder::new();
@@ -1877,9 +2118,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)]
     async fn test_liar_peer_effect() {
+        let _arena = install_test_arena();
         use equix::EquiXBuilder;
         use tokio::sync::mpsc;
 
@@ -1940,9 +2182,10 @@ mod tests {
         assert!(swarm_rx.try_recv().is_err(), "Should only send one action");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)] // ibig has a memory leak so miri fails this test
     async fn test_track_add_effect() {
+        let _arena = install_test_arena();
         use equix::EquiXBuilder;
         use tokio::sync::mpsc;
 
@@ -1965,6 +2208,7 @@ mod tests {
         let add_cell = T(&mut effect_slab, &[add_atom.as_noun(), data_cell]);
         let track_cell = T(&mut effect_slab, &[track_atom.as_noun(), add_cell]);
         effect_slab.set_root(track_cell);
+        let space = effect_slab.noun_space();
 
         // Create message tracker and other required components
         let (swarm_tx, _swarm_rx) = mpsc::channel(1);
@@ -1995,7 +2239,7 @@ mod tests {
         assert!(result.is_ok(), "handle_effect should succeed");
 
         // Get the expected block ID string (base58 of [1 2 3 4 5])
-        let block_id_str = tip5_hash_to_base58(block_id_tuple).unwrap_or_else(|_| {
+        let block_id_str = tip5_hash_to_base58(block_id_tuple, &space).unwrap_or_else(|_| {
             panic!(
                 "Called `expect()` at {}:{} (git sha: {})",
                 file!(),
@@ -2008,7 +2252,7 @@ mod tests {
         let state_guard = state_arc.lock().await;
 
         // Check block_id_to_peers mapping
-        let peers = state_guard.get_peers_for_block_id(block_id_tuple);
+        let peers = state_guard.get_peers_for_block_id(block_id_tuple, &space);
         assert!(
             peers.contains(&peer_id),
             "Peer ID should be associated with block ID"
@@ -2022,9 +2266,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)] // ibig has a memory leak so miri fails this test
     async fn test_track_remove_effect() {
+        let _arena = install_test_arena();
         use equix::EquiXBuilder;
         use tokio::sync::mpsc;
 
@@ -2044,11 +2289,12 @@ mod tests {
         // Create block ID as [1 2 3 4 5]
         let mut setup_slab: NounSlab = NounSlab::new();
         let block_id_tuple = T(&mut setup_slab, &[D(1), D(2), D(3), D(4), D(5)]);
+        let setup_space = setup_slab.noun_space();
 
         {
             let mut state_guard = state_arc.lock().await;
             state_guard
-                .track_block_id_and_peer(block_id_tuple, peer_id)
+                .track_block_id_and_peer(block_id_tuple, peer_id, &setup_space)
                 .unwrap_or_else(|_| {
                     panic!(
                         "Called `expect()` at {}:{} (git sha: {})",
@@ -2059,7 +2305,7 @@ mod tests {
                 });
 
             // Verify it was added correctly
-            assert!(state_guard.is_tracking_block_id(block_id_tuple));
+            assert!(state_guard.is_tracking_block_id(block_id_tuple, &setup_space));
             assert!(state_guard.is_tracking_peer(peer_id));
         }
 
@@ -2108,7 +2354,7 @@ mod tests {
 
         // Check that the block ID was removed from block_id_to_peers
         assert!(
-            !state_guard.is_tracking_block_id(block_id_tuple),
+            !state_guard.is_tracking_block_id(block_id_tuple, &setup_space),
             "Block ID should be removed"
         );
 
@@ -2120,9 +2366,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)] // ibig has a memory leak so miri fails this test
     async fn test_liar_block_id_effect() {
+        let _arena = install_test_arena();
         use equix::EquiXBuilder;
         use tokio::sync::mpsc;
 
@@ -2153,6 +2400,7 @@ mod tests {
         let bad_block_id = T(&mut setup_slab, &[D(1), D(2), D(3), D(4), D(5)]);
         // Good block ID as [6 7 8 9 10]
         let good_block_id = T(&mut setup_slab, &[D(6), D(7), D(8), D(9), D(10)]);
+        let setup_space = setup_slab.noun_space();
         println!("Created block_ids");
 
         {
@@ -2161,7 +2409,7 @@ mod tests {
 
             // Associate bad_peer1 with the bad block
             state_guard
-                .track_block_id_and_peer(bad_block_id, bad_peer1)
+                .track_block_id_and_peer(bad_block_id, bad_peer1, &setup_space)
                 .unwrap_or_else(|_| {
                     panic!(
                         "Called `expect()` at {}:{} (git sha: {})",
@@ -2173,7 +2421,7 @@ mod tests {
 
             // Associate bad_peer2 with the bad block
             state_guard
-                .add_peer_if_tracking_block_id(bad_block_id, bad_peer2)
+                .add_peer_if_tracking_block_id(bad_block_id, bad_peer2, &setup_space)
                 .unwrap_or_else(|_| {
                     panic!(
                         "Called `expect()` at {}:{} (git sha: {})",
@@ -2185,7 +2433,7 @@ mod tests {
 
             // Associate good_peer with a different block
             state_guard
-                .track_block_id_and_peer(good_block_id, good_peer)
+                .track_block_id_and_peer(good_block_id, good_peer, &setup_space)
                 .unwrap_or_else(|_| {
                     panic!(
                         "Called `expect()` at {}:{} (git sha: {})",
@@ -2196,8 +2444,8 @@ mod tests {
                 });
 
             // Verify tracking is working
-            assert!(state_guard.is_tracking_block_id(bad_block_id));
-            assert!(state_guard.is_tracking_block_id(good_block_id));
+            assert!(state_guard.is_tracking_block_id(bad_block_id, &setup_space));
+            assert!(state_guard.is_tracking_block_id(good_block_id, &setup_space));
             assert!(state_guard.is_tracking_peer(bad_peer1));
             assert!(state_guard.is_tracking_peer(bad_peer2));
             assert!(state_guard.is_tracking_peer(good_peer));
@@ -2291,13 +2539,13 @@ mod tests {
 
             // Bad block should be removed
             assert!(
-                !state_guard.is_tracking_block_id(bad_block_id),
+                !state_guard.is_tracking_block_id(bad_block_id, &setup_space),
                 "Bad block ID should be removed"
             );
 
             // Good block should still be tracked
             assert!(
-                state_guard.is_tracking_block_id(good_block_id),
+                state_guard.is_tracking_block_id(good_block_id, &setup_space),
                 "Good block ID should still be tracked"
             );
 
@@ -2321,16 +2569,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)] // ibig has a memory leak so miri fails this test
 
     async fn test_seen_block_effect() {
+        let _arena = install_test_arena();
         use equix::EquiXBuilder;
         use tokio::sync::mpsc;
 
         let mut effect_slab = NounSlab::new();
         let block_id = T(&mut effect_slab, &[D(1), D(2), D(3), D(4), D(5)]);
-        let block_id_str = tip5_hash_to_base58(block_id).unwrap_or_else(|_| {
+        let space = effect_slab.noun_space();
+        let block_id_str = tip5_hash_to_base58(block_id, &space).unwrap_or_else(|_| {
             panic!(
                 "Called `expect()` at {}:{} (git sha: {})",
                 file!(),
@@ -2376,15 +2626,17 @@ mod tests {
         assert!(contains, "Block ID should be marked as seen");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)] // ibig has a memory leak so miri fails this test
     async fn test_seen_tx_effect() {
+        let _arena = install_test_arena();
         use equix::EquiXBuilder;
         use tokio::sync::mpsc;
 
         let mut effect_slab = NounSlab::new();
         let tx_id = T(&mut effect_slab, &[D(1), D(2), D(3), D(4), D(5)]);
-        let tx_id_str = tip5_hash_to_base58(tx_id).unwrap_or_else(|_| {
+        let space = effect_slab.noun_space();
+        let tx_id_str = tip5_hash_to_base58(tx_id, &space).unwrap_or_else(|_| {
             panic!(
                 "Called `expect()` at {}:{} (git sha: {})",
                 file!(),

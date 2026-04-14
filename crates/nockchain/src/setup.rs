@@ -4,7 +4,7 @@ use nockapp::noun::slab::{Jammer, NounSlab};
 use nockapp::utils::make_tas;
 use nockapp::wire::Wire;
 use nockapp::{AtomExt, Bytes, NockApp, NockAppError, ToBytes};
-use nockchain_types::BlockchainConstants;
+pub use nockchain_types::{fakenet_blockchain_constants, BlockchainConstants, Seconds};
 use nockvm::noun::{Atom, D, T};
 use nockvm_macros::tas;
 use noun_serde::NounEncode;

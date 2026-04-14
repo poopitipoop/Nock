@@ -73,6 +73,11 @@ pub struct NockchainCli {
         default_value = "false"
     )]
     pub no_new_peer_id: bool,
+    #[arg(
+        long,
+        help = "Override the path to the libp2p identity key (defaults to .nockchain_identity)"
+    )]
+    pub identity_path: Option<PathBuf>,
     #[arg(long, help = "Maximum established incoming connections")]
     pub max_established_incoming: Option<u32>,
     #[arg(long, help = "Maximum established outgoing connections")]
@@ -186,6 +191,7 @@ mod tests {
             no_default_peers: false,
             bind: None,
             no_new_peer_id: false,
+            identity_path: None,
             max_established_incoming: None,
             max_established_outgoing: None,
             max_pending_incoming: None,

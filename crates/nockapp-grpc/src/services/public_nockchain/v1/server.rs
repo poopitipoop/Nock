@@ -8,7 +8,7 @@ use nockapp::driver::{NockAppHandle, PokeResult};
 use nockapp::noun::slab::NounSlab;
 use nockapp::wire::WireRepr;
 use nockchain_types::tx_engine::v0;
-use nockvm::noun::SIG;
+use nockvm::noun::{NounAllocator, SIG};
 use noun_serde::{NounDecode, NounEncode};
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
@@ -161,7 +161,9 @@ impl PublicNockchainGrpcServer {
         let result = match peek_result {
             Ok(Some(result_slab)) => {
                 let result_noun = unsafe { result_slab.root() };
-                match <Option<Option<(v0::BlockHeight, v0::Hash)>>>::from_noun(&result_noun) {
+                let space = result_slab.noun_space();
+                match <Option<Option<(v0::BlockHeight, v0::Hash)>>>::from_noun(&result_noun, &space)
+                {
                     Ok(opt) => Ok(opt.flatten()),
                     // Peek either returned [~ ~] or ~
                     Err(_) => Err(NockAppGrpcError::PeekReturnedNoData),
@@ -413,7 +415,8 @@ impl NockchainService for PublicNockchainGrpcServer {
         match peek_result {
             Ok(Some(result_slab)) => {
                 let result_noun = unsafe { result_slab.root() };
-                let result = <Option<Option<v0::BalanceUpdate>>>::from_noun(&result_noun);
+                let space = result_slab.noun_space();
+                let result = <Option<Option<v0::BalanceUpdate>>>::from_noun(&result_noun, &space);
 
                 match result {
                     Ok(update) => {
@@ -723,7 +726,8 @@ impl NockchainService for PublicNockchainGrpcServer {
         match peek_result {
             Ok(Some(result_slab)) => {
                 let result_noun = unsafe { result_slab.root() };
-                match <Option<Option<bool>>>::from_noun(&result_noun) {
+                let space = result_slab.noun_space();
+                match <Option<Option<bool>>>::from_noun(&result_noun, &space) {
                     Ok(opt) => {
                         let accepted = opt.flatten().unwrap_or(false);
                         timed_return(
@@ -782,6 +786,7 @@ mod tests {
     use std::sync::Arc;
 
     use nockchain_math::crypto::cheetah::A_GEN;
+    use nockvm::mem::NockStack;
 
     use super::*;
     use crate::pb::common::v1 as pb_common;
@@ -812,8 +817,9 @@ mod tests {
             &self,
             path: NounSlab,
         ) -> std::result::Result<Option<NounSlab>, nockapp::nockapp::error::NockAppError> {
+            let space = path.noun_space();
             let root = unsafe { path.root() };
-            if let Ok(segments) = <Vec<String>>::from_noun(&root) {
+            if let Ok(segments) = <Vec<String>>::from_noun(&root, &space) {
                 if segments.first().map(String::as_str) == Some("heaviest-chain") {
                     let mut slab = NounSlab::new();
                     let noun = Some(Some((
@@ -842,8 +848,24 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    struct TestArenaGuard {
+        _stack: NockStack,
+    }
+
+    impl TestArenaGuard {
+        fn install() -> Self {
+            let stack = NockStack::new(1 << 16, 0);
+            Self { _stack: stack }
+        }
+    }
+
+    impl Drop for TestArenaGuard {
+        fn drop(&mut self) {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn wallet_get_balance_uses_cache_for_subsequent_pages() {
+        let _arena = TestArenaGuard::install();
         let (update, expected_names) = fixtures::make_balance_update(4);
         let handle = Arc::new(MockHandle::new(update));
         let server = PublicNockchainGrpcServer::with_handle(handle.clone());

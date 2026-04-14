@@ -33,6 +33,11 @@ enum UntaggedWithUnit {
     Pair(u64, u64),
 }
 
+fn decode_in_stack<T: NounDecode>(noun: &nockvm::noun::Noun, stack: &NockStack) -> T {
+    let space = stack.noun_space();
+    T::from_noun(noun, &space).expect("decode noun")
+}
+
 #[test]
 fn untagged_enum_roundtrip_full() {
     let mut stack = NockStack::new(8 << 10 << 10, 0);
@@ -43,7 +48,7 @@ fn untagged_enum_roundtrip_full() {
         version: tas!(b"full"),
     });
     let noun = proof.to_noun(&mut stack);
-    let decoded = LockMerkleProof::from_noun(&noun).expect("decode full");
+    let decoded: LockMerkleProof = decode_in_stack(&noun, &stack);
     assert_eq!(decoded, proof);
 }
 
@@ -56,7 +61,7 @@ fn untagged_enum_decodes_stub() {
         proof: 9,
     };
     let noun = proof.to_noun(&mut stack);
-    let decoded = LockMerkleProof::from_noun(&noun).expect("decode stub");
+    let decoded: LockMerkleProof = decode_in_stack(&noun, &stack);
     assert_eq!(decoded, LockMerkleProof::Stub(proof));
 }
 
@@ -70,7 +75,7 @@ fn untagged_enum_stub_roundtrip_via_wrapper() {
         proof: 300,
     });
     let noun = proof.to_noun(&mut stack);
-    let decoded = LockMerkleProof::from_noun(&noun).expect("decode stub via wrapper");
+    let decoded: LockMerkleProof = decode_in_stack(&noun, &stack);
     assert_eq!(decoded, proof);
 }
 
@@ -85,7 +90,7 @@ fn untagged_enum_full_has_correct_version() {
         version: tas!(b"full"),
     });
     let noun = proof.to_noun(&mut stack);
-    let decoded = LockMerkleProof::from_noun(&noun).expect("decode full");
+    let decoded = decode_in_stack(&noun, &stack);
     match decoded {
         LockMerkleProof::Full(full) => {
             assert_eq!(full.version, tas!(b"full"));
@@ -101,12 +106,12 @@ fn untagged_enum_discriminates_by_structure() {
 
     // Build a 3-tuple manually: [spend_condition axis proof]
     let three_tuple = T(&mut stack, &[D(10), D(20), D(30)]);
-    let decoded_3 = LockMerkleProof::from_noun(&three_tuple).expect("decode 3-tuple");
+    let decoded_3 = decode_in_stack(&three_tuple, &stack);
     assert!(matches!(decoded_3, LockMerkleProof::Stub(_)));
 
     // Build a 4-tuple manually: [spend_condition axis proof version]
     let four_tuple = T(&mut stack, &[D(10), D(20), D(30), D(tas!(b"full"))]);
-    let decoded_4 = LockMerkleProof::from_noun(&four_tuple).expect("decode 4-tuple");
+    let decoded_4 = decode_in_stack(&four_tuple, &stack);
     assert!(matches!(decoded_4, LockMerkleProof::Full(_)));
 }
 
@@ -117,8 +122,7 @@ fn untagged_enum_four_tuple_with_wrong_version_still_decodes_as_full() {
     let mut stack = NockStack::new(8 << 10 << 10, 0);
 
     let four_tuple_wrong_version = T(&mut stack, &[D(10), D(20), D(30), D(999)]);
-    let decoded = LockMerkleProof::from_noun(&four_tuple_wrong_version)
-        .expect("decode 4-tuple with wrong version");
+    let decoded = decode_in_stack(&four_tuple_wrong_version, &stack);
     match decoded {
         LockMerkleProof::Full(full) => {
             // It decoded as Full, but version is wrong
@@ -150,8 +154,8 @@ fn untagged_enum_full_and_stub_decode_correctly_with_same_prefix() {
     let stub_noun = stub.to_noun(&mut stack);
     let full_noun = full.to_noun(&mut stack);
 
-    let decoded_stub = LockMerkleProof::from_noun(&stub_noun).expect("decode stub");
-    let decoded_full = LockMerkleProof::from_noun(&full_noun).expect("decode full");
+    let decoded_stub = decode_in_stack(&stub_noun, &stack);
+    let decoded_full = decode_in_stack(&full_noun, &stack);
 
     // Stub decodes as Stub, Full decodes as Full
     assert!(matches!(decoded_stub, LockMerkleProof::Stub(_)));
@@ -182,14 +186,14 @@ fn untagged_enum_unit_variant_requires_zero_atom() {
     let mut stack = NockStack::new(8 << 10 << 10, 0);
 
     let atom_one = D(1);
-    let decoded_atom = UntaggedWithUnit::from_noun(&atom_one).expect("decode atom");
+    let decoded_atom: UntaggedWithUnit = decode_in_stack(&atom_one, &stack);
     assert_eq!(decoded_atom, UntaggedWithUnit::Value(1));
 
     let cell = T(&mut stack, &[D(2), D(3)]);
-    let decoded_cell = UntaggedWithUnit::from_noun(&cell).expect("decode cell");
+    let decoded_cell: UntaggedWithUnit = decode_in_stack(&cell, &stack);
     assert_eq!(decoded_cell, UntaggedWithUnit::Pair(2, 3));
 
     let zero = D(0);
-    let decoded_zero = UntaggedWithUnit::from_noun(&zero).expect("decode zero atom");
+    let decoded_zero: UntaggedWithUnit = decode_in_stack(&zero, &stack);
     assert_eq!(decoded_zero, UntaggedWithUnit::Empty);
 }

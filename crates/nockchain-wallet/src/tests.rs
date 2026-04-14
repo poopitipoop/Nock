@@ -15,7 +15,7 @@ use nockchain_types::tx_engine::common::{BlockHeight, BlockHeightDelta, Nicks, S
 use nockchain_types::tx_engine::v1::note::{NoteData, NoteDataEntry};
 use nockchain_types::tx_engine::v1::tx::{Lock, LockPrimitive, Pkh, SpendCondition};
 use nockchain_types::tx_engine::{v0, v1};
-use nockvm::noun::{Slots, T};
+use nockvm::noun::{NounAllocator, T};
 use noun_serde::{NounDecode, NounEncode};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -124,18 +124,22 @@ fn note_v0_with_lock(name: Name, origin_page: u64, assets: u64, lock: v0::Lock) 
     })
 }
 
-fn noun_leaf_count(noun: nockapp::Noun) -> u64 {
+fn noun_leaf_count(noun: nockapp::Noun, space: &nockvm::noun::NounSpace) -> u64 {
     if noun.is_atom() {
         return 1;
     }
-    let cell = noun.as_cell().expect("noun should decode as cell");
-    noun_leaf_count(cell.head()).saturating_add(noun_leaf_count(cell.tail()))
+    let cell = noun
+        .in_space(space)
+        .as_cell()
+        .expect("noun should decode as cell");
+    noun_leaf_count(cell.head().noun(), space).saturating_add(noun_leaf_count(cell.tail().noun(), space))
 }
 
 fn word_count_from_noun_encode<T: NounEncode>(value: &T) -> u64 {
     let mut slab: NounSlab = NounSlab::new();
     let noun = value.to_noun(&mut slab);
-    noun_leaf_count(noun)
+    let space = slab.noun_space();
+    noun_leaf_count(noun, &space)
 }
 
 fn merged_seed_word_count(spends: &v1::Spends) -> u64 {
@@ -207,8 +211,9 @@ fn decode_saved_transaction_spends(effects: &[NounSlab]) -> Result<v1::Spends, N
     let tx_bytes = effects
         .iter()
         .find_map(|effect| {
+            let space = effect.noun_space();
             let noun = unsafe { effect.root() };
-            let cell = noun.as_cell().ok()?;
+            let cell = noun.in_space(&space).as_cell().ok()?;
             let tag = cell.head().as_atom().ok()?.into_string().ok()?;
             if tag != "file" {
                 return None;
@@ -231,12 +236,15 @@ fn decode_saved_transaction_spends(effects: &[NounSlab]) -> Result<v1::Spends, N
 
     let mut slab: NounSlab = NounSlab::new();
     let transaction_noun = slab.cue_into(tx_bytes)?;
-    let transaction_cell = transaction_noun.as_cell().map_err(|err| {
+    let space = slab.noun_space();
+    let transaction_cell = transaction_noun.in_space(&space).as_cell().map_err(|err| {
         NockAppError::OtherError(format!("transaction jam root not a cell: {err}"))
     })?;
-    let version = <u64 as NounDecode>::from_noun(&transaction_cell.head()).map_err(|err| {
+    let version = <u64 as NounDecode>::from_noun(&transaction_cell.head().noun(), &space).map_err(
+        |err| {
         NockAppError::OtherError(format!("transaction version did not decode: {err}"))
-    })?;
+    },
+    )?;
     if version != 1 {
         return Err(NockAppError::OtherError(format!(
             "expected saved transaction version 1, got {version}"
@@ -248,9 +256,11 @@ fn decode_saved_transaction_spends(effects: &[NounSlab]) -> Result<v1::Spends, N
     let spends_and_rest = name_and_rest.tail().as_cell().map_err(|err| {
         NockAppError::OtherError(format!("transaction jam missing spends/rest cell: {err}"))
     })?;
-    let mut spends = v1::Spends::from_noun(&spends_and_rest.head()).map_err(|err| {
+    let mut spends = v1::Spends::from_noun(&spends_and_rest.head().noun(), &space).map_err(
+        |err| {
         NockAppError::OtherError(format!("saved transaction spends did not decode: {err}"))
-    })?;
+    },
+    )?;
     let display_and_witness = spends_and_rest.tail().as_cell().map_err(|err| {
         NockAppError::OtherError(format!(
             "transaction jam missing display/witness-data cell: {err}"
@@ -260,17 +270,21 @@ fn decode_saved_transaction_spends(effects: &[NounSlab]) -> Result<v1::Spends, N
     let witness_cell = witness_data.as_cell().map_err(|err| {
         NockAppError::OtherError(format!("transaction jam witness-data not a cell: {err}"))
     })?;
-    let witness_tag = <u64 as NounDecode>::from_noun(&witness_cell.head()).map_err(|err| {
+    let witness_tag = <u64 as NounDecode>::from_noun(&witness_cell.head().noun(), &space).map_err(
+        |err| {
         NockAppError::OtherError(format!("witness-data tag did not decode: {err}"))
-    })?;
+    },
+    )?;
     match witness_tag {
         0 => {
             let signatures =
-                ZMap::<Name, Signature>::from_noun(&witness_cell.tail()).map_err(|err| {
+                ZMap::<Name, Signature>::from_noun(&witness_cell.tail().noun(), &space).map_err(
+                    |err| {
                     NockAppError::OtherError(format!(
                         "legacy witness-data signature map did not decode: {err}"
                     ))
-                })?;
+                },
+                )?;
             for (name, signature) in signatures.into_entries() {
                 let Some((_, v1::Spend::Legacy(spend0))) = spends
                     .0
@@ -288,9 +302,11 @@ fn decode_saved_transaction_spends(effects: &[NounSlab]) -> Result<v1::Spends, N
         }
         1 => {
             let witnesses =
-                ZMap::<Name, v1::Witness>::from_noun(&witness_cell.tail()).map_err(|err| {
+                ZMap::<Name, v1::Witness>::from_noun(&witness_cell.tail().noun(), &space).map_err(
+                    |err| {
                     NockAppError::OtherError(format!("v1 witness-data map did not decode: {err}"))
-                })?;
+                },
+                )?;
             for (name, witness) in witnesses.into_entries() {
                 let Some((_, v1::Spend::Witness(spend1))) = spends
                     .0
@@ -323,13 +339,47 @@ fn format_note_names(names: &[Name]) -> String {
         .join(",")
 }
 
+fn decode_option_handle<'a>(
+    noun: nockvm::noun::NounHandle<'a>,
+) -> Result<Option<nockvm::noun::NounHandle<'a>>, NockAppError> {
+    if let Ok(atom) = noun.as_atom() {
+        let tag = atom
+            .as_u64()
+            .map_err(|err| NockAppError::OtherError(format!("option tag did not decode: {err}")))?;
+        return match tag {
+            1 => Ok(None),
+            other => Err(NockAppError::OtherError(format!(
+                "unexpected option atom tag {other}"
+            ))),
+        };
+    }
+
+    let cell = noun
+        .as_cell()
+        .map_err(|err| NockAppError::OtherError(format!("option payload not a cell: {err}")))?;
+    let tag = cell
+        .head()
+        .as_atom()
+        .map_err(|err| NockAppError::OtherError(format!("option head not an atom: {err}")))?
+        .as_u64()
+        .map_err(|err| NockAppError::OtherError(format!("option head did not decode: {err}")))?;
+    if tag != 0 {
+        return Err(NockAppError::OtherError(format!(
+            "unexpected option cell tag {tag}"
+        )));
+    }
+    Ok(Some(cell.tail()))
+}
+
 async fn peek_signing_keys(wallet: &mut Wallet) -> Result<Vec<Hash>, NockAppError> {
     let mut slab = NounSlab::new();
     let tag = make_tas(&mut slab, "signing-keys").as_noun();
     slab.modify(|_| vec![tag, SIG]);
 
     let result = wallet.app.peek(slab).await?;
-    let decoded: Option<Option<Vec<Hash>>> = unsafe { Option::from_noun(result.root())? };
+    let space = result.noun_space();
+    let decoded: Option<Option<Vec<Hash>>> =
+        unsafe { Option::from_noun(result.root(), &space)? };
     Ok(decoded.flatten().unwrap_or_default())
 }
 
@@ -339,7 +389,9 @@ async fn peek_signing_pubkeys(wallet: &mut Wallet) -> Result<Vec<SchnorrPubkey>,
     slab.modify(|_| vec![tag, SIG]);
 
     let result = wallet.app.peek(slab).await?;
-    let decoded: Option<Option<Vec<SchnorrPubkey>>> = unsafe { Option::from_noun(result.root())? };
+    let space = result.noun_space();
+    let decoded: Option<Option<Vec<SchnorrPubkey>>> =
+        unsafe { Option::from_noun(result.root(), &space)? };
     Ok(decoded.flatten().unwrap_or_default())
 }
 
@@ -392,13 +444,16 @@ async fn peek_wallet_blockchain_constants(
     slab.modify(|_| vec![state_tag, SIG]);
 
     let result = wallet.app.peek(slab).await?;
-    let decoded: Option<Option<Noun>> = unsafe { Option::from_noun(result.root())? };
-    let state = decoded
-        .flatten()
+    let space = result.noun_space();
+    let root = unsafe { *result.root() }.in_space(&space);
+    let state = decode_option_handle(root)?
+        .and_then(|inner| decode_option_handle(inner).transpose())
+        .transpose()?
         .ok_or_else(|| NockAppError::OtherError("missing wallet state payload".to_string()))?;
-    PlannerBlockchainConstantsNoun::from_noun(&state.slot(31).map_err(|err| {
+    let constants = state.slot(31).map_err(|err| {
         NockAppError::OtherError(format!("wallet state missing blockchain constants: {err}"))
-    })?)
+    })?;
+    PlannerBlockchainConstantsNoun::from_noun(&constants.noun(), &space)
     .map_err(|err| NockAppError::OtherError(format!("decode blockchain constants failed: {err}")))
 }
 
@@ -409,8 +464,9 @@ async fn peek_balance_state(wallet: &mut Wallet) -> Result<v1::BalanceUpdate, No
     slab.set_root(path);
 
     let result = wallet.app.peek(slab).await?;
+    let space = result.noun_space();
     let maybe_balance: Option<Option<v1::BalanceUpdate>> =
-        unsafe { <Option<Option<v1::BalanceUpdate>>>::from_noun(result.root())? };
+        unsafe { <Option<Option<v1::BalanceUpdate>>>::from_noun(result.root(), &space)? };
     match maybe_balance {
         Some(Some(balance)) => Ok(balance),
         _ => Err(NockAppError::OtherError(
@@ -808,19 +864,21 @@ fn planner_constants_decode_from_dedicated_peek_shape() {
         },
         base_fee: 128,
         input_fee_divisor: 4,
-        _legacy_constants: D(0),
+        coinbase_timelock_min: 99,
     };
     let wrapped = Some(Some(constants));
 
     let mut slab: NounSlab<NockJammer> = NounSlab::new();
     let noun = wrapped.to_noun(&mut slab);
+    let space = slab.noun_space();
     let decoded: Option<Option<PlannerBlockchainConstantsNoun>> =
-        Option::from_noun(&noun).expect("peek payload should decode");
+        Option::from_noun(&noun, &space).expect("peek payload should decode");
     let parsed = decoded.flatten().expect("payload should be present");
     assert_eq!(parsed.bythos_phase, 54_000);
     assert_eq!(parsed.base_fee, 128);
     assert_eq!(parsed.input_fee_divisor, 4);
     assert_eq!(parsed.data.min_fee, 256);
+    assert_eq!(parsed.coinbase_timelock_min().unwrap(), 99);
 }
 
 #[test]
@@ -830,8 +888,9 @@ fn planner_constants_extract_coinbase_timelock_min_from_payload() {
 
     let mut slab: NounSlab<NockJammer> = NounSlab::new();
     let noun = wrapped.to_noun(&mut slab);
+    let space = slab.noun_space();
     let decoded: Option<Option<PlannerBlockchainConstantsNoun>> =
-        Option::from_noun(&noun).expect("peek payload should decode");
+        Option::from_noun(&noun, &space).expect("peek payload should decode");
     let parsed = decoded.flatten().expect("payload should be present");
 
     assert_eq!(
@@ -1232,8 +1291,9 @@ fn signing_keys_decode_from_hash_list_payload_shape() {
 
     let mut slab: NounSlab<NockJammer> = NounSlab::new();
     let noun = wrapped.to_noun(&mut slab);
+    let space = slab.noun_space();
     let decoded: Option<Option<Vec<Hash>>> =
-        Option::from_noun(&noun).expect("signing keys payload should decode");
+        Option::from_noun(&noun, &space).expect("signing keys payload should decode");
     let parsed = decoded.flatten().expect("payload should be present");
 
     assert_eq!(parsed, vec![hash(3), hash(2)]);
@@ -1290,9 +1350,10 @@ async fn test_keygen() -> Result<(), NockAppError> {
         keygen_result.len() == 2,
         "Expected keygen result to be a list of 2 noun slabs - markdown and exit"
     );
-    let exit_cause = unsafe { keygen_result[1].root() };
+    let exit_space = keygen_result[1].noun_space();
+    let exit_cause = unsafe { *keygen_result[1].root() }.in_space(&exit_space);
     let code = exit_cause.as_cell()?.tail();
-    assert!(unsafe { code.raw_equals(&D(0)) }, "Expected exit code 0");
+    assert_eq!(code.as_atom()?.as_u64()?, 0, "Expected exit code 0");
 
     Ok(())
 }
@@ -1342,9 +1403,10 @@ async fn test_derive_child() -> Result<(), NockAppError> {
         "Expected derive result to be a list of 2 noun slabs - markdown and exit"
     );
 
-    let exit_cause = unsafe { derive_result[1].root() };
+    let exit_space = derive_result[1].noun_space();
+    let exit_cause = unsafe { *derive_result[1].root() }.in_space(&exit_space);
     let code = exit_cause.as_cell()?.tail();
-    assert!(unsafe { code.raw_equals(&D(0)) }, "Expected exit code 0");
+    assert_eq!(code.as_atom()?.as_u64()?, 0, "Expected exit code 0");
 
     Ok(())
 }

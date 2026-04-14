@@ -14,17 +14,19 @@ const TIP_CACHE_TAG: u64 = tas!(b"zntip");
 const DOUBLE_TIP_CACHE_TAG: u64 = tas!(b"zndtip");
 
 pub fn dor_tip_jet(context: &mut Context, subject: Noun) -> Result<Noun, JetErr> {
-    let sam = slot(subject, 6)?;
-    let mut a = slot(sam, 2)?;
-    let mut b = slot(sam, 3)?;
+    let space = context.stack.noun_space();
+    let sam = slot(subject, 6, &space)?;
+    let mut a = slot(sam, 2, &space)?;
+    let mut b = slot(sam, 3, &space)?;
 
     Ok(bool_to_noun(dor_tip(&mut context.stack, &mut a, &mut b)?))
 }
 
 pub fn gor_tip_jet(context: &mut Context, subject: Noun) -> Result<Noun, JetErr> {
-    let sam = slot(subject, 6)?;
-    let mut a = slot(sam, 2)?;
-    let mut b = slot(sam, 3)?;
+    let space = context.stack.noun_space();
+    let sam = slot(subject, 6, &space)?;
+    let mut a = slot(sam, 2, &space)?;
+    let mut b = slot(sam, 3, &space)?;
 
     let a_tip = get_tip_digest(context, a)?;
     let b_tip = get_tip_digest(context, b)?;
@@ -39,9 +41,10 @@ pub fn gor_tip_jet(context: &mut Context, subject: Noun) -> Result<Noun, JetErr>
 }
 
 pub fn mor_tip_jet(context: &mut Context, subject: Noun) -> Result<Noun, JetErr> {
-    let sam = slot(subject, 6)?;
-    let mut a = slot(sam, 2)?;
-    let mut b = slot(sam, 3)?;
+    let space = context.stack.noun_space();
+    let sam = slot(subject, 6, &space)?;
+    let mut a = slot(sam, 2, &space)?;
+    let mut b = slot(sam, 3, &space)?;
 
     let a_tip = get_double_tip_digest(context, a)?;
     let b_tip = get_double_tip_digest(context, b)?;
@@ -68,9 +71,10 @@ fn cache_lookup_digest(
     tag: u64,
     noun: Noun,
 ) -> Result<Option<[u64; 5]>, JetErr> {
+    let space = context.stack.noun_space();
     let mut key = T(&mut context.stack, &[D(tag), noun]);
     match context.cache.lookup(&mut context.stack, &mut key) {
-        Some(cached) => Ok(Some(<[u64; 5]>::from_noun(&cached)?)),
+        Some(cached) => Ok(Some(<[u64; 5]>::from_noun(&cached, &space)?)),
         None => Ok(None),
     }
 }
@@ -85,8 +89,8 @@ fn get_tip_digest(context: &mut Context, noun: Noun) -> Result<[u64; 5], JetErr>
     if let Some(cached) = cache_lookup_digest(context, TIP_CACHE_TAG, noun)? {
         return Ok(cached);
     }
-
-    let digest = hash_noun_varlen_digest(&mut context.stack, noun)?;
+    let space = context.stack.noun_space();
+    let digest = hash_noun_varlen_digest(&mut context.stack, noun, &space)?;
     cache_insert_digest(context, TIP_CACHE_TAG, noun, digest);
     Ok(digest)
 }

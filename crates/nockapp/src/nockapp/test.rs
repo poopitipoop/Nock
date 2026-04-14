@@ -5,10 +5,9 @@ use tempfile::TempDir;
 
 use super::NockApp;
 use crate::kernel::form::Kernel;
+use crate::save::SaveableCheckpoint;
 
-pub async fn setup_nockapp(jam: &str) -> (TempDir, NockApp) {
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let temp_dir_path = temp_dir.path().to_path_buf();
+fn load_jam_bytes(jam: &str) -> Vec<u8> {
     // Try multiple possible locations for the jam file
     let possible_paths = [
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -18,222 +17,367 @@ pub async fn setup_nockapp(jam: &str) -> (TempDir, NockApp) {
         // Add other potential paths
     ];
 
-    let jam_bytes = possible_paths
+    possible_paths
         .iter()
         .find_map(|path| fs::read(path).ok())
-        .unwrap_or_else(|| panic!("Failed to read {} file from any known location", jam));
+        .unwrap_or_else(|| panic!("Failed to read {} file from any known location", jam))
+}
 
-    let kernel_f =
-        async |checkpoint| Kernel::load(&jam_bytes, checkpoint, vec![], Default::default()).await;
+pub async fn setup_nockapp(jam: &str) -> (TempDir, NockApp) {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let jam_bytes = load_jam_bytes(jam);
+
+    let kernel_f = move |_| async move {
+        let kernel = Kernel::load(&jam_bytes, None, vec![], Default::default(), None).await?;
+        Ok::<Kernel<SaveableCheckpoint>, crate::CrownError>(kernel)
+    };
     (
         temp_dir,
-        NockApp::new(
-            kernel_f,
-            &temp_dir_path,
-            Some(std::time::Duration::from_secs(1)),
-            true,
-        )
-        .await
-        .expect("Could not create NockApp"),
+        NockApp::new(kernel_f)
+            .await
+            .expect("Could not create NockApp"),
     )
 }
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
+    use nockvm::ext::noun_equality;
     use nockvm::jets::util::slot;
     use nockvm::mem::NockStack;
-    use nockvm::noun::{Noun, D, T};
+    use nockvm::noun::{CellHandle, Noun, NounAllocator, NounSpace, D, T};
     use nockvm::serialization::{cue, jam};
     use nockvm::unifying_equality::unifying_equality;
     use nockvm_macros::tas;
-    use tracing::info;
+    use tempfile::TempDir;
     use tracing_test::traced_test;
 
-    use super::setup_nockapp;
+    use super::{load_jam_bytes, setup_nockapp};
+    use crate::kernel::form::{Kernel, PmaConfig};
     use crate::nockapp::wire::{SystemWire, Wire};
-    use crate::noun::slab::{slab_equality, slab_noun_equality, NockJammer, NounSlab};
-    use crate::save::{SaveableCheckpoint, Saver};
-    use crate::utils::NOCK_STACK_SIZE;
-    use crate::{NockApp, NounExt};
+    use crate::noun::slab::{slab_equality, NockJammer, NounSlab};
+    use crate::save::CheckpointBootstrapReader;
+    use crate::test_support::TestArena;
+    use crate::utils::{
+        NOCK_STACK_SIZE, NOCK_STACK_SIZE_HUGE, NOCK_STACK_SIZE_LARGE, NOCK_STACK_SIZE_MEDIUM,
+        NOCK_STACK_SIZE_SMALL, NOCK_STACK_SIZE_TINY,
+    };
+    use crate::NounExt;
 
-    async fn save_nockapp(nockapp: &mut NockApp) {
-        nockapp.tasks.close();
-        let permit = nockapp.save_mutex.clone().lock_owned().await;
-        let _ = nockapp.save(permit).await;
-        let _ = nockapp.tasks.wait().await;
-        nockapp.tasks.reopen();
+    fn summarize_samples(label: &str, samples: &[Duration]) -> (f64, f64, f64) {
+        if samples.is_empty() {
+            println!("perf: {}: no samples", label);
+            return (0.0, 0.0, 0.0);
+        }
+        let mut min = samples[0];
+        let mut max = samples[0];
+        let mut total_us: u128 = 0;
+        for sample in samples {
+            if *sample < min {
+                min = *sample;
+            }
+            if *sample > max {
+                max = *sample;
+            }
+            total_us += sample.as_micros();
+        }
+        let count = samples.len() as f64;
+        let avg_ms = (total_us as f64) / count / 1000.0;
+        let min_ms = (min.as_micros() as f64) / 1000.0;
+        let max_ms = (max.as_micros() as f64) / 1000.0;
+        println!(
+            "perf: {}: n={}, avg_ms={:.3}, min_ms={:.3}, max_ms={:.3}",
+            label,
+            samples.len(),
+            avg_ms,
+            min_ms,
+            max_ms
+        );
+        (avg_ms, min_ms, max_ms)
     }
 
-    // Panics if checkpoint failed to load, only permissible because this is expressly for testing
-    async fn spawn_save_t(nockapp: &mut NockApp, sleep_t: std::time::Duration) {
-        let sleepy_time = tokio::time::sleep(sleep_t);
-        let permit = nockapp.save_mutex.clone().lock_owned().await;
-        let _join_handle = nockapp
-            .save_f(sleepy_time, permit)
-            .await
-            .expect("Failed to spawn nockapp save task");
-        // join_handle.await.expect("Failed to save nockapp").expect("Failed to save nockapp 2");
-    }
-
-    // Test nockapp save
-    // TODO: bump the actual serf event number (can we do a poke to the test kernel?)
-    #[test]
+    #[tokio::test(flavor = "current_thread")]
     #[traced_test]
     #[cfg_attr(miri, ignore)]
-    fn test_nockapp_save_race_condition() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap_or_else(|err| {
-                panic!(
-                    "Panicked with {err:?} at {}:{} (git sha: {:?})",
-                    file!(),
-                    line!(),
-                    option_env!("GIT_SHA")
+    #[ignore]
+    async fn test_poke_peek_perf_workload() {
+        std::env::set_var("NOCK_PMA_TIMING", "1");
+        std::env::set_var("NOCKAPP_DISABLE_METRICS", "1");
+
+        let _test_arena = TestArena::default();
+        let kernel_bytes = if let Some(path) = std::env::var_os("NOCKAPP_PERF_KERNEL_JAM") {
+            let path = PathBuf::from(path);
+            fs::read(&path)
+                .unwrap_or_else(|err| panic!("Failed to read kernel jam from {:?}: {err}", path))
+        } else {
+            load_jam_bytes("test-ker.jam")
+        };
+
+        let checkpoint = if let Some(path) = std::env::var_os("NOCKAPP_PERF_CHECKPOINT_DIR") {
+            let path = PathBuf::from(path);
+            CheckpointBootstrapReader::<NockJammer>::new(path.clone())
+                .load_latest(None)
+                .await
+                .unwrap_or_else(|err| panic!("Failed to load checkpoint from {:?}: {err}", path))
+        } else {
+            None
+        };
+
+        let stack_choice =
+            std::env::var("NOCKAPP_PERF_STACK").unwrap_or_else(|_| "normal".to_string());
+        let pma_words_override = std::env::var("NOCKAPP_PERF_PMA_WORDS")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok());
+        let mut checkpoint = checkpoint;
+        let (stack_words, kernel, _pma_dir) = match stack_choice.as_str() {
+            "tiny" => {
+                let pma_dir = TempDir::new().expect("Failed to create temp PMA dir");
+                let pma_path_0 = pma_dir.path().join("0.pma");
+                let pma_path_1 = pma_dir.path().join("1.pma");
+                let pma_words = pma_words_override.unwrap_or(NOCK_STACK_SIZE_TINY);
+                let pma_config = Some(PmaConfig {
+                    path_0: pma_path_0,
+                    path_1: pma_path_1,
+                    words: pma_words,
+                    open_existing: false,
+                    create_snapshots: false,
+                    rotating_snapshot_interval_event_time: None,
+                    restore_manifest: None,
+                    gc_interval: None,
+                });
+                let kernel = Kernel::load_with_hot_state_tiny(
+                    &kernel_bytes,
+                    checkpoint.take(),
+                    &[],
+                    vec![],
+                    Default::default(),
+                    pma_config,
                 )
-            });
-        let (temp, mut nockapp) = runtime.block_on(setup_nockapp("test-ker.jam"));
-        assert_eq!(nockapp.kernel.serf.event_number.load(Ordering::SeqCst), 0);
-        // first run
-        runtime.block_on(spawn_save_t(&mut nockapp, Duration::from_millis(1000)));
-        // second run
-        nockapp.kernel.serf.event_number.store(1, Ordering::SeqCst); // we need to set the actual serf event number
-        runtime.block_on(spawn_save_t(&mut nockapp, Duration::from_millis(5000)));
-        // Simulate what the event handlers would be doing and wait for the task tracker to be done
-        nockapp.tasks.close();
-        runtime.block_on(nockapp.tasks.wait());
-        nockapp.tasks.reopen();
-        // Shutdown the runtime immediately
-        runtime.shutdown_timeout(std::time::Duration::from_secs(0));
+                .await
+                .expect("Failed to load kernel");
+                (NOCK_STACK_SIZE_TINY, kernel, pma_dir)
+            }
+            "small" => {
+                let pma_dir = TempDir::new().expect("Failed to create temp PMA dir");
+                let pma_path_0 = pma_dir.path().join("0.pma");
+                let pma_path_1 = pma_dir.path().join("1.pma");
+                let pma_words = pma_words_override.unwrap_or(NOCK_STACK_SIZE_SMALL);
+                let pma_config = Some(PmaConfig {
+                    path_0: pma_path_0,
+                    path_1: pma_path_1,
+                    words: pma_words,
+                    open_existing: false,
+                    create_snapshots: false,
+                    rotating_snapshot_interval_event_time: None,
+                    restore_manifest: None,
+                    gc_interval: None,
+                });
+                let kernel = Kernel::load_with_hot_state_small(
+                    &kernel_bytes,
+                    checkpoint.take(),
+                    &[],
+                    vec![],
+                    Default::default(),
+                    pma_config,
+                )
+                .await
+                .expect("Failed to load kernel");
+                (NOCK_STACK_SIZE_SMALL, kernel, pma_dir)
+            }
+            "medium" => {
+                let pma_dir = TempDir::new().expect("Failed to create temp PMA dir");
+                let pma_path_0 = pma_dir.path().join("0.pma");
+                let pma_path_1 = pma_dir.path().join("1.pma");
+                let pma_words = pma_words_override.unwrap_or(NOCK_STACK_SIZE_MEDIUM);
+                let pma_config = Some(PmaConfig {
+                    path_0: pma_path_0,
+                    path_1: pma_path_1,
+                    words: pma_words,
+                    open_existing: false,
+                    create_snapshots: false,
+                    rotating_snapshot_interval_event_time: None,
+                    restore_manifest: None,
+                    gc_interval: None,
+                });
+                let kernel = Kernel::load_with_hot_state_medium(
+                    &kernel_bytes,
+                    checkpoint.take(),
+                    &[],
+                    vec![],
+                    Default::default(),
+                    pma_config,
+                )
+                .await
+                .expect("Failed to load kernel");
+                (NOCK_STACK_SIZE_MEDIUM, kernel, pma_dir)
+            }
+            "large" => {
+                let pma_dir = TempDir::new().expect("Failed to create temp PMA dir");
+                let pma_path_0 = pma_dir.path().join("0.pma");
+                let pma_path_1 = pma_dir.path().join("1.pma");
+                let pma_words = pma_words_override.unwrap_or(NOCK_STACK_SIZE_LARGE);
+                let pma_config = Some(PmaConfig {
+                    path_0: pma_path_0,
+                    path_1: pma_path_1,
+                    words: pma_words,
+                    open_existing: false,
+                    create_snapshots: false,
+                    rotating_snapshot_interval_event_time: None,
+                    restore_manifest: None,
+                    gc_interval: None,
+                });
+                let kernel = Kernel::load_with_hot_state_large(
+                    &kernel_bytes,
+                    checkpoint.take(),
+                    &[],
+                    vec![],
+                    Default::default(),
+                    pma_config,
+                )
+                .await
+                .expect("Failed to load kernel");
+                (NOCK_STACK_SIZE_LARGE, kernel, pma_dir)
+            }
+            "huge" => {
+                let pma_dir = TempDir::new().expect("Failed to create temp PMA dir");
+                let pma_path_0 = pma_dir.path().join("0.pma");
+                let pma_path_1 = pma_dir.path().join("1.pma");
+                let pma_words = pma_words_override.unwrap_or(NOCK_STACK_SIZE_HUGE);
+                let pma_config = Some(PmaConfig {
+                    path_0: pma_path_0,
+                    path_1: pma_path_1,
+                    words: pma_words,
+                    open_existing: false,
+                    create_snapshots: false,
+                    rotating_snapshot_interval_event_time: None,
+                    restore_manifest: None,
+                    gc_interval: None,
+                });
+                let kernel = Kernel::load_with_hot_state_huge(
+                    &kernel_bytes,
+                    checkpoint.take(),
+                    &[],
+                    vec![],
+                    Default::default(),
+                    pma_config,
+                )
+                .await
+                .expect("Failed to load kernel");
+                (NOCK_STACK_SIZE_HUGE, kernel, pma_dir)
+            }
+            _ => {
+                let pma_dir = TempDir::new().expect("Failed to create temp PMA dir");
+                let pma_path_0 = pma_dir.path().join("0.pma");
+                let pma_path_1 = pma_dir.path().join("1.pma");
+                let pma_words = pma_words_override.unwrap_or(NOCK_STACK_SIZE);
+                let pma_config = Some(PmaConfig {
+                    path_0: pma_path_0,
+                    path_1: pma_path_1,
+                    words: pma_words,
+                    open_existing: false,
+                    create_snapshots: false,
+                    rotating_snapshot_interval_event_time: None,
+                    restore_manifest: None,
+                    gc_interval: None,
+                });
+                let kernel = Kernel::load_with_hot_state(
+                    &kernel_bytes,
+                    checkpoint.take(),
+                    &[],
+                    vec![],
+                    Default::default(),
+                    pma_config,
+                )
+                .await
+                .expect("Failed to load kernel");
+                (NOCK_STACK_SIZE, kernel, pma_dir)
+            }
+        };
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("Failed to build runtime");
+        let pma_timing = kernel
+            .serf
+            .pma_timing
+            .clone()
+            .expect("NOCK_PMA_TIMING must be set before setup");
+        let _ = pma_timing.take_samples();
 
-        let (_, checkpoint_opt) = runtime
-            .block_on(Saver::<NockJammer>::try_load(
-                &temp.path().to_path_buf(),
-                None,
-            ))
-            .expect("Failed trying to load checkpoint");
-        let checkpoint: SaveableCheckpoint = checkpoint_opt.expect("No checkpoint found");
-        info!("checkpoint: {:?}", checkpoint);
-        assert_eq!(checkpoint.event_num, 1);
-    }
+        let iters: usize = std::env::var("NOCKAPP_PERF_ITERS")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(20);
+        let warmup: usize = std::env::var("NOCKAPP_PERF_WARMUP")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(1);
 
-    // Test nockapp save
-    // TODO: need a way to grab arvo state from the serf. Probably a serf action
-    // TODO: use slab equality, not unifying equality
-    #[tokio::test]
-    #[traced_test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_nockapp_save() {
-        // console_subscriber::init();
-        let (temp, mut nockapp) = setup_nockapp("test-ker.jam").await;
-        let first_checkpoint = nockapp
-            .kernel
-            .checkpoint()
-            .await
-            .expect("Couldn't get kernel checkpoint");
+        let poke_jam_path = std::env::var_os("NOCKAPP_PERF_POKE_JAM");
+        let peek_jam_path = std::env::var_os("NOCKAPP_PERF_PEEK_JAM");
+        let use_custom_jam = poke_jam_path.is_some() || peek_jam_path.is_some();
+        if poke_jam_path.is_some() != peek_jam_path.is_some() {
+            panic!("Both NOCKAPP_PERF_POKE_JAM and NOCKAPP_PERF_PEEK_JAM must be set together");
+        }
 
-        assert_eq!(nockapp.kernel.serf.event_number.load(Ordering::SeqCst), 0);
-        // Save
-        info!("Saving nockapp");
-        save_nockapp(&mut nockapp).await;
-        // Permit should be dropped
+        let (poke_jam, peek_jam) =
+            if let (Some(poke_path), Some(peek_path)) = (poke_jam_path, peek_jam_path) {
+                let poke_path = PathBuf::from(poke_path);
+                let peek_path = PathBuf::from(peek_path);
+                let poke_jam = fs::read(&poke_path).unwrap_or_else(|err| {
+                    panic!("Failed to read poke jam from {:?}: {err}", poke_path)
+                });
+                let peek_jam = fs::read(&peek_path).unwrap_or_else(|err| {
+                    panic!("Failed to read peek jam from {:?}: {err}", peek_path)
+                });
+                (poke_jam, peek_jam)
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
-        // A valid checkpoint should exist in one of the jam files
-        let (_, checkpoint_opt) = Saver::<NockJammer>::try_load(&temp.path().to_path_buf(), None)
-            .await
-            .expect("Could not load checkpoint");
-        let checkpoint: SaveableCheckpoint = checkpoint_opt.expect("No checkpoint loaded");
+        let mut stack = if use_custom_jam {
+            None
+        } else {
+            Some(NockStack::new(NOCK_STACK_SIZE, 0))
+        };
+        let mut poke_wall = Vec::with_capacity(iters);
+        let mut peek_wall = Vec::with_capacity(iters);
 
-        // Checkpoint event number should be 0
-        assert_eq!(checkpoint.event_num, 0);
+        println!(
+            "perf: stack_words={}, iters={}, warmup_skipped={}, custom_jam={}",
+            stack_words, iters, warmup, use_custom_jam
+        );
 
-        info!("Asserting checkpoint and arvo equality");
-        // Checkpoint kernel should be equal to the saved kernel
-        assert!(slab_equality(&checkpoint.state, &first_checkpoint.state));
-        assert!(slab_equality(&checkpoint.cold, &first_checkpoint.cold));
-    }
-
-    // Test nockapp poke
-    #[tokio::test]
-    #[traced_test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_nockapp_poke_save() {
-        let (temp, mut nockapp) = setup_nockapp("test-ker.jam").await;
-        assert_eq!(nockapp.kernel.serf.event_number.load(Ordering::SeqCst), 0);
-        let state_before_poke = nockapp
-            .kernel
-            .checkpoint()
-            .await
-            .expect("Can't get kernel state before poke");
-
-        let poke_noun = D(tas!(b"inc"));
-        let poke = {
+        let make_slab_from_jam = |jam: &[u8]| -> NounSlab {
             let mut slab = NounSlab::new();
-            slab.copy_into(poke_noun);
+            let noun = slab
+                .cue_into(Bytes::copy_from_slice(jam))
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "Panicked with {err:?} at {}:{} (git sha: {:?})",
+                        file!(),
+                        line!(),
+                        option_env!("GIT_SHA")
+                    )
+                });
+            slab.set_root(noun);
             slab
         };
 
-        let wire = SystemWire.to_wire();
-        let _ = nockapp.kernel.poke(wire, poke).await.unwrap_or_else(|err| {
-            panic!(
-                "Panicked with {err:?} at {}:{} (git sha: {:?})",
-                file!(),
-                line!(),
-                option_env!("GIT_SHA")
-            )
-        });
-
-        // Save
-        save_nockapp(&mut nockapp).await;
-
-        // A valid checkpoint should exist in one of the jam files
-        let (_, checkpoint_opt) = Saver::<NockJammer>::try_load(&temp.path().to_path_buf(), None)
-            .await
-            .expect("Failed to load checkpoint");
-        let checkpoint: SaveableCheckpoint = checkpoint_opt.expect("No checkpoint");
-
-        // Checkpoint event number should be 1
-        assert!(checkpoint.event_num == 1);
-        let state_after_poke = nockapp
-            .kernel
-            .checkpoint()
-            .await
-            .expect("Failed to get checkpoint after poke");
-
-        assert!(slab_equality(&checkpoint.state, &state_after_poke.state));
-        assert!(slab_equality(&checkpoint.cold, &state_after_poke.cold));
-        assert!(!slab_equality(&checkpoint.state, &state_before_poke.state));
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_nockapp_save_multiple() {
-        let (temp, mut nockapp) = setup_nockapp("test-ker.jam").await;
-        assert_eq!(nockapp.kernel.serf.event_number.load(Ordering::SeqCst), 0);
-        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
-
-        for i in 1..4 {
-            // Poke to increment the state
-            let poke_noun = D(tas!(b"inc"));
-            let poke = {
+        for i in 1..=iters {
+            let poke = if use_custom_jam {
+                make_slab_from_jam(&poke_jam)
+            } else {
+                let poke_noun = D(tas!(b"inc"));
                 let mut slab = NounSlab::new();
-                slab.copy_into(poke_noun);
+                let space = NounSpace::empty();
+                slab.copy_into(poke_noun, &space);
                 slab
             };
             let wire = SystemWire.to_wire();
-            let _ = nockapp.kernel.poke(wire, poke).await.unwrap_or_else(|err| {
+            let poke_start = Instant::now();
+            let _ = kernel.poke(wire, poke).await.unwrap_or_else(|err| {
                 panic!(
                     "Panicked with {err:?} at {}:{} (git sha: {:?})",
                     file!(),
@@ -241,30 +385,20 @@ pub mod tests {
                     option_env!("GIT_SHA")
                 )
             });
+            poke_wall.push(poke_start.elapsed());
 
-            // Save
-            save_nockapp(&mut nockapp).await;
-
-            // A valid checkpoint should exist in one of the jam files
-            let (_, checkpoint_opt) =
-                Saver::<NockJammer>::try_load(&temp.path().to_path_buf(), None)
-                    .await
-                    .expect("Failed to load checkpoint");
-            let checkpoint: SaveableCheckpoint = checkpoint_opt.expect("No checkpoint found");
-
-            // Checkpoint event number should be i
-            assert!(checkpoint.event_num == i);
-
-            // Checkpointed state should have been incremented
-            let peek_noun = T(&mut stack, &[D(tas!(b"state")), D(0)]);
-            let peek = {
+            let peek = if use_custom_jam {
+                make_slab_from_jam(&peek_jam)
+            } else {
+                let stack = stack.as_mut().expect("stack");
+                let space = stack.noun_space();
+                let peek_noun = T(stack, &[D(tas!(b"state")), D(0)]);
                 let mut slab = NounSlab::new();
-                slab.copy_into(peek_noun);
+                slab.copy_into(peek_noun, &space);
                 slab
             };
-
-            // res should be [~ ~ [%0 val]]
-            let mut res = nockapp.kernel.peek(peek).await.unwrap_or_else(|err| {
+            let peek_start = Instant::now();
+            let mut res = kernel.peek(peek).await.unwrap_or_else(|err| {
                 panic!(
                     "Panicked with {err:?} at {}:{} (git sha: {:?})",
                     file!(),
@@ -272,39 +406,110 @@ pub mod tests {
                     option_env!("GIT_SHA")
                 )
             });
-            res.modify_noun(|r| {
-                slot(r, 7)
-                    .unwrap_or_else(|err| {
+            peek_wall.push(peek_start.elapsed());
+
+            if use_custom_jam {
+                if i == 1 {
+                    let jammed = res.jam();
+                    let mut roundtrip = NounSlab::<NockJammer>::new();
+                    let noun = roundtrip.cue_into(jammed).unwrap_or_else(|err| {
                         panic!(
                             "Panicked with {err:?} at {}:{} (git sha: {:?})",
                             file!(),
                             line!(),
                             option_env!("GIT_SHA")
                         )
-                    })
-                    .as_cell()
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "Panicked with {err:?} at {}:{} (git sha: {:?})",
-                            file!(),
-                            line!(),
-                            option_env!("GIT_SHA")
-                        )
-                    })
-                    .tail()
-            });
+                    });
+                    roundtrip.set_root(noun);
+                    assert!(
+                        slab_equality(&res, &roundtrip),
+                        "peek roundtrip mismatch: res={:?} roundtrip={:?}",
+                        res,
+                        roundtrip
+                    );
+                }
+            } else {
+                let res_space = res.noun_space();
+                res.modify_noun(|r| {
+                    let cell = slot(r, 7, &res_space)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "Panicked with {err:?} at {}:{} (git sha: {:?})",
+                                file!(),
+                                line!(),
+                                option_env!("GIT_SHA")
+                            )
+                        })
+                        .as_cell()
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "Panicked with {err:?} at {}:{} (git sha: {:?})",
+                                file!(),
+                                line!(),
+                                option_env!("GIT_SHA")
+                            )
+                        });
+                    CellHandle::new(cell, &res_space).tail().noun()
+                });
 
-            let comp = {
-                let mut slab = NounSlab::new();
-                slab.copy_into(D(i));
-                slab
-            };
+                let comp = {
+                    let mut slab = NounSlab::<NockJammer>::new();
+                    let space = NounSpace::empty();
+                    slab.copy_into(D(i as u64), &space);
+                    slab
+                };
 
-            assert!(
-                slab_equality(&res, &comp),
-                "res: {:?} != comp: {:?}",
-                res,
-                comp
+                assert!(
+                    slab_equality(&res, &comp),
+                    "res: {:?} != comp: {:?}",
+                    res,
+                    comp
+                );
+            }
+        }
+
+        let mut pma_samples = pma_timing.take_samples();
+        assert_eq!(
+            pma_samples.len(),
+            iters,
+            "expected one PMA timing sample per poke"
+        );
+
+        let skip = warmup.min(iters);
+        let poke_wall = if poke_wall.len() > skip {
+            &poke_wall[skip..]
+        } else {
+            &[]
+        };
+        let peek_wall = if peek_wall.len() > skip {
+            &peek_wall[skip..]
+        } else {
+            &[]
+        };
+        if pma_samples.len() > skip {
+            pma_samples = pma_samples.split_off(skip);
+        } else {
+            pma_samples.clear();
+        }
+
+        let event_samples: Vec<Duration> = pma_samples.iter().map(|s| s.event).collect();
+        let pma_copy_samples: Vec<Duration> = pma_samples.iter().map(|s| s.pma_copy).collect();
+        let total_samples: Vec<Duration> =
+            pma_samples.iter().map(|s| s.event + s.pma_copy).collect();
+
+        println!(
+            "perf: pokes={}, peeks={}, warmup_skipped={}",
+            iters, iters, skip
+        );
+        let (_event_avg, _, _) = summarize_samples("poke_event", &event_samples);
+        let (pma_avg, _, _) = summarize_samples("poke_pma_copy", &pma_copy_samples);
+        let (total_avg, _, _) = summarize_samples("poke_event_plus_pma", &total_samples);
+        summarize_samples("poke_wall", poke_wall);
+        summarize_samples("peek_wall", peek_wall);
+        if total_avg > 0.0 {
+            println!(
+                "perf: poke_pma_share_avg_pct={:.1}",
+                (pma_avg / total_avg) * 100.0
             );
         }
     }
@@ -382,9 +587,10 @@ pub mod tests {
     }
     */
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)]
     async fn test_jam_equality_stack() {
+        let _test_arena = TestArena::default();
         let (_temp, nockapp) = setup_nockapp("test-ker.jam").await;
         let kernel = nockapp.kernel;
         let mut jam_stack = NockStack::new(NOCK_STACK_SIZE, 0);
@@ -412,6 +618,7 @@ pub mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_jam_equality_slab_no_driver() {
+        let _test_arena = TestArena::default();
         let bytes = include_bytes!("../../test-jams/test-ker.jam");
         let mut slab1: NounSlab = NounSlab::new();
         slab1
@@ -426,7 +633,7 @@ pub mod tests {
             });
         let jammed_bytes = slab1.jam();
         let mut slab2: NounSlab = NounSlab::new();
-        let c = slab2.cue_into(jammed_bytes).unwrap_or_else(|err| {
+        let _c = slab2.cue_into(jammed_bytes).unwrap_or_else(|err| {
             panic!(
                 "Panicked with {err:?} at {}:{} (git sha: {:?})",
                 file!(),
@@ -434,12 +641,13 @@ pub mod tests {
                 option_env!("GIT_SHA")
             )
         });
-        unsafe { assert!(slab_noun_equality(slab1.root(), &c)) }
+        assert!(slab_equality(&slab1, &slab2));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)]
     async fn test_jam_equality_slab() {
+        let _test_arena = TestArena::default();
         let (_temp, nockapp) = setup_nockapp("test-ker.jam").await;
         let kernel = nockapp.kernel;
         let mut state_slab = kernel
@@ -456,12 +664,15 @@ pub mod tests {
                 option_env!("GIT_SHA")
             )
         });
-        unsafe { assert!(slab_noun_equality(state_slab.root(), &c)) }
+        let space = state_slab.noun_space();
+        let root = unsafe { state_slab.root() };
+        assert!(noun_equality(root.in_space(&space), c.in_space(&space)));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(miri, ignore)]
     async fn test_jam_equality_slab_stack() {
+        let _test_arena = TestArena::default();
         let (_temp, nockapp) = setup_nockapp("test-ker.jam").await;
         let kernel = nockapp.kernel;
         let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);

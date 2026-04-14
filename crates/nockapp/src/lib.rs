@@ -1,3 +1,4 @@
+#![feature(negative_impls)]
 #![feature(slice_pattern)]
 // Allow unwrap in test code - standard practice for test assertions
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -15,10 +16,12 @@
 //! - `utils`: Errors, misc functions and extensions.
 //!
 pub mod drivers;
+pub(crate) mod event_log;
 pub mod kernel;
 pub mod nockapp;
 pub mod noun;
 pub mod observability;
+pub(crate) mod snapshot;
 pub mod utils;
 
 use std::path::PathBuf;
@@ -70,3 +73,83 @@ pub fn system_data_dir() -> PathBuf {
 
 /// Default size for the Nock stack (1 GB)
 pub const DEFAULT_NOCK_STACK_SIZE: usize = 1 << 27;
+
+#[cfg(test)]
+pub mod test_support {
+    use std::cell::Cell;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use nockvm::mem::NockStack;
+
+    pub struct NativePmaTestGuard {
+        _guard: Option<MutexGuard<'static, ()>>,
+    }
+
+    pub struct TestArena {
+        _guard: NativePmaTestGuard,
+        stack: NockStack,
+    }
+
+    impl TestArena {
+        pub fn with_words(words: usize) -> Self {
+            let guard = native_pma_test_guard();
+            let stack = NockStack::new(words, 0);
+            Self {
+                _guard: guard,
+                stack,
+            }
+        }
+    }
+
+    impl Default for TestArena {
+        fn default() -> Self {
+            // A modest stack is enough because tests mostly need TLS to be populated.
+            Self::with_words(1 << 16)
+        }
+    }
+
+    impl std::ops::Deref for TestArena {
+        type Target = NockStack;
+
+        fn deref(&self) -> &Self::Target {
+            &self.stack
+        }
+    }
+
+    impl std::ops::DerefMut for TestArena {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.stack
+        }
+    }
+
+    thread_local! {
+        static NATIVE_PMA_TEST_GUARD_DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    impl Drop for NativePmaTestGuard {
+        fn drop(&mut self) {
+            NATIVE_PMA_TEST_GUARD_DEPTH.with(|depth| {
+                let current = depth.get();
+                depth.set(current.saturating_sub(1));
+            });
+        }
+    }
+
+    pub fn native_pma_test_guard() -> NativePmaTestGuard {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = NATIVE_PMA_TEST_GUARD_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current.saturating_add(1));
+            if current == 0 {
+                Some(
+                    LOCK.get_or_init(|| Mutex::new(()))
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                )
+            } else {
+                None
+            }
+        });
+        NativePmaTestGuard { _guard: guard }
+    }
+}

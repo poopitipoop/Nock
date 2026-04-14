@@ -52,7 +52,9 @@ use nockchain_types::tx_engine::common::Name;
 use nockchain_types::tx_engine::v1::tx::{LockPrimitive, SpendCondition};
 use nockchain_types::{default_fakenet_blockchain_constants, v0, v1};
 use nockvm::jets::cold::Nounable;
-use nockvm::noun::{Atom, Cell, IndirectAtom, Noun, D, NO, SIG, T, YES};
+#[cfg(test)]
+use nockvm::mem::NockStack;
+use nockvm::noun::{Atom, Cell, IndirectAtom, Noun, NounAllocator, D, NO, SIG, T, YES};
 use noun_serde::prelude::*;
 use noun_serde::NounDecodeError;
 #[cfg(test)]
@@ -75,6 +77,24 @@ use wallet_tx_builder::types::{
 use zkvm_jetpack::hot::produce_prover_hot_state;
 
 use crate::public_nockchain::v2::client::BalanceRequest;
+
+#[cfg(test)]
+struct TestArenaGuard {
+    _stack: NockStack,
+}
+
+#[cfg(test)]
+impl TestArenaGuard {
+    fn install() -> Self {
+        let stack = NockStack::new(1 << 16, 0);
+        Self { _stack: stack }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestArenaGuard {
+    fn drop(&mut self) {}
+}
 
 #[tokio::main]
 async fn main() -> Result<(), NockAppError> {
@@ -365,7 +385,10 @@ async fn main() -> Result<(), NockAppError> {
             pubkey_slab
                 .to_vec()
                 .iter()
-                .map(|key| String::from_noun(unsafe { key.root() }))
+                .map(|key| {
+                    let space = key.noun_space();
+                    String::from_noun(unsafe { key.root() }, &space)
+                })
                 .collect::<Result<Vec<String>, NounDecodeError>>()?
                 .into_iter()
                 .filter_map(|value| match normalize_watch_address(value) {
@@ -380,7 +403,8 @@ async fn main() -> Result<(), NockAppError> {
 
         let first_names: Vec<String> = if let Some(name_slab) = first_name_slab {
             let names_noun = unsafe { name_slab.root() };
-            <Vec<String>>::from_noun(names_noun)?
+            let name_space = name_slab.noun_space();
+            <Vec<String>>::from_noun(names_noun, &name_space)?
         } else {
             Vec::new()
         };
@@ -500,7 +524,7 @@ impl Wallet {
         slab.modify(|_| vec![tag, SIG]);
         let result = self.app.peek(slab).await?;
         let is_fakenet: Option<Option<bool>> =
-            unsafe { <Option<Option<bool>>>::from_noun(result.root())? };
+            unsafe { <Option<Option<bool>>>::from_noun(result.root(), &result.noun_space())? };
         match is_fakenet {
             Some(Some(res)) => Ok(res),
             _ => Err(NockAppError::OtherError(
@@ -1436,6 +1460,6 @@ fn format_transaction_accepted_markdown(tx_id: &str, accepted: bool) -> String {
 pub fn from_bytes(stack: &mut NounSlab, bytes: &[u8]) -> Atom {
     unsafe {
         let mut tas_atom = IndirectAtom::new_raw_bytes(stack, bytes.len(), bytes.as_ptr());
-        tas_atom.normalize_as_atom()
+        tas_atom.normalize_as_atom_stack()
     }
 }

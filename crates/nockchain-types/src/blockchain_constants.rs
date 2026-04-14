@@ -264,13 +264,13 @@ mod tests {
 
     use super::*;
 
-    fn tuple_len(noun: Noun) -> usize {
+    fn tuple_len(noun: Noun, space: &nockvm::noun::NounSpace) -> usize {
         let mut len = 0;
         let mut cur = noun;
         loop {
-            if let Ok(cell) = cur.as_cell() {
+            if let Ok(cell) = cur.in_space(space).as_cell() {
                 len += 1;
-                cur = cell.tail();
+                cur = cell.tail().noun();
             } else {
                 len += 1;
                 break;
@@ -385,8 +385,9 @@ mod tests {
     fn blockchain_constants_encode_in_new_v1_wrapper() {
         let slab = BlockchainConstants::new().into_slab();
         let root = unsafe { *slab.root() };
+        let space = slab.noun_space();
 
-        let outer = root.as_cell().expect("outer tuple");
+        let outer = root.in_space(&space).as_cell().expect("outer tuple");
         let v1_phase_atom = outer.head().as_atom().expect("v1-phase should be atom");
         assert_eq!(
             v1_phase_atom.as_u64().expect("v1-phase as u64"),
@@ -445,13 +446,13 @@ mod tests {
             BlockchainConstants::DEFAULT_INPUT_FEE_DIVISOR
         );
 
-        let v0_constants = input_fee_divisor_and_rest.tail();
+        let v0_constants = input_fee_divisor_and_rest.tail().noun();
         assert_eq!(
-            tuple_len(v0_constants),
+            tuple_len(v0_constants, &space),
             13,
             "v0 constants should be a 13-tuple"
         );
-        let v0_cell = v0_constants.as_cell().expect("v0 constants tuple");
+        let v0_cell = v0_constants.in_space(&space).as_cell().expect("v0 constants tuple");
         let max_block_size_atom = v0_cell.head().as_atom().expect("max-block-size atom");
         assert_eq!(
             max_block_size_atom.as_u64().expect("max-block-size as u64"),

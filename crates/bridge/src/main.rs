@@ -686,6 +686,7 @@ mod tests {
     use nockapp::kernel::boot;
     use nockchain_math::belt::Belt;
     use nockchain_types::v1::Name;
+    use nockvm::noun::NounAllocator;
     use tempfile::TempDir;
 
     use super::*;
@@ -847,7 +848,8 @@ mod tests {
         let noun = unsafe {
             let mut ia =
                 nockvm::noun::IndirectAtom::new_raw_bytes(&mut slab, 32, proposal_hash.as_ptr());
-            ia.normalize_as_atom()
+            let space = slab.noun_space();
+            ia.normalize_as_atom(&space)
         };
         let signature = bridge_signer.sign_proposal(noun.as_noun()).await?;
 

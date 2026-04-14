@@ -12,6 +12,29 @@ export MINING_PKH ?= 9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV
 export
 
 ZIGBUILD_TARGET ?= x86_64-unknown-linux-gnu.2.39
+DOCKER_IMAGE ?= nockchain-local
+DOCKER_MEM ?= 32g
+# DOCKER_MEM_SWAP ?= 32g
+DOCKER_P2P_PORT ?= 30000
+DOCKER_DATA_DIR ?= $(CURDIR)/.data.nockchain
+DOCKER_NOCKCHAIN_ENVS ?=
+DOCKER_NOCKCHAIN_ARGS ?=
+DOCKER_METRICS_COMPOSE ?= docker-compose.metrics.yml
+DOCKER_METRICS_NETWORK ?= nockchain-metrics
+INFLUXDB_VERSION ?= 2.7
+TELEGRAF_VERSION ?= 1.30
+STATSD_HOST ?= telegraf
+STATSD_PORT ?= 8125
+GENESIS_SYNC_RUST_LOG ?= info,nockapp::kernel::form=info,nockapp::kernel::boot=info,nockapp::utils::durability=info
+GENESIS_SYNC_MINIMAL_LOG_FORMAT ?= true
+GENESIS_SYNC_PEER ?=
+GENESIS_SYNC_COMMON_ARGS ?=
+GENESIS_SYNC_EXTRA_ARGS ?=
+GENESIS_SYNC_NODE_CMD ?= cargo run --release --bin nockchain --
+GENESIS_SYNC_DATA_DIR_ON ?= $(CURDIR)/.data.nockchain-sync-fsync-on
+GENESIS_SYNC_DATA_DIR_OFF ?= $(CURDIR)/.data.nockchain-sync-fsync-off
+GENESIS_SYNC_BIND_PORT_ON ?= 31000
+GENESIS_SYNC_BIND_PORT_OFF ?= 31001
 
 .PHONY: build
 build: build-hoon-all build-rust
@@ -21,6 +44,10 @@ build: build-hoon-all build-rust
 .PHONY: build-rust
 build-rust:
 	cargo build --release
+
+.PHONY: contracts-deps
+contracts-deps: ## Install Solidity dependencies for bridge crate
+		$(MAKE) -C crates/bridge/contracts deps
 
 .PHONY: install-cargo-zigbuild
 install-cargo-zigbuild:
@@ -42,6 +69,81 @@ build-nockchain-bridge-tui:
 .PHONY: test
 test:
 	cargo test --release
+
+.PHONY: bench-nockchain-kernel
+bench-nockchain-kernel:
+	cargo run --release -p nockchain --bin bench_nockchain_kernel -- --skip-mining
+
+.PHONY: bench-nockchain-checkpoint-block
+bench-nockchain-checkpoint-block:
+	cargo run --release -p nockchain --bin bench_nockchain_checkpoint_block --
+
+.PHONY: test-pma-paging-kernel
+test-pma-paging-kernel:
+	NOCKCHAIN_PMA_PAGING_SKIP_MINING=1 NOCKCHAIN_PMA_PAGING_SKIP_TXS=1 NOCKCHAIN_PMA_PAGING_BLOCKS=250 NOCKCHAIN_PMA_PAGING_BYTES=1073741824 NOCKCHAIN_PMA_PAGING_OUTPUTS=1 cargo test --release --test pma_paging_kernel -- --ignored
+# NOCKCHAIN_PMA_PAGING_SKIP_MINING=1 NOCKCHAIN_PMA_PAGING_BLOCKS=100000 NOCKCHAIN_PMA_PAGING_BYTES=1073741824 NOCKCHAIN_PMA_PAGING_OUTPUTS=128 cargo test --release --test pma_paging_kernel -- --ignored
+
+.PHONY: test-pma-persist-blocks
+test-pma-persist-blocks:
+	cargo test --release --test pma_persist_blocks
+
+.PHONY: docker-nockchain
+docker-nockchain: docker-nockchain-build docker-nockchain-run
+
+.PHONY: docker-nockchain-pma-persist
+docker-nockchain-pma-persist: docker-nockchain-build
+	$(MAKE) docker-nockchain-run \
+		DOCKER_NOCKCHAIN_ENVS="-e NOCK_PMA_PERSIST=1" \
+		DOCKER_NOCKCHAIN_ARGS="--pma-persist $(DOCKER_NOCKCHAIN_ARGS)"
+
+.PHONY: docker-nockchain-build
+docker-nockchain-build:
+	docker build -t $(DOCKER_IMAGE) .
+# --checkpoint-mode stream \
+.PHONY: docker-nockchain-run
+docker-nockchain-run:
+	mkdir -p $(DOCKER_DATA_DIR)
+	@docker network inspect $(DOCKER_METRICS_NETWORK) >/dev/null 2>&1 || docker network create $(DOCKER_METRICS_NETWORK)
+	docker run --rm -it --name nockchain \
+		--network $(DOCKER_METRICS_NETWORK) \
+		--memory $(DOCKER_MEM) \
+		-e RUST_BACKTRACE=1 \
+		-e NOCK_PMA_TIMING=1 \
+		-e NOCK_PMA_TIMING_DETAIL=1 \
+		-e NOCK_STACK_TIMING_DETAIL=1 \
+		-e STATSD_HOST=$(STATSD_HOST) \
+		-e STATSD_PORT=$(STATSD_PORT) \
+		$(DOCKER_NOCKCHAIN_ENVS) \
+		-p $(DOCKER_P2P_PORT):$(DOCKER_P2P_PORT)/udp \
+		-v $(DOCKER_DATA_DIR):/data/.data.nockchain \
+		$(DOCKER_IMAGE) \
+		--fast-sync --num-threads 0 \
+		--save-interval 300000 \
+		--gc-interval 120000 \
+		--data-dir /data/.data.nockchain \
+		--identity-path /data/.data.nockchain/.nockchain_identity \
+		--bind /ip4/0.0.0.0/udp/$(DOCKER_P2P_PORT)/quic-v1 \
+		$(DOCKER_NOCKCHAIN_ARGS)
+
+.PHONY: docker-metrics
+docker-metrics:
+	@docker network inspect $(DOCKER_METRICS_NETWORK) >/dev/null 2>&1 || docker network create $(DOCKER_METRICS_NETWORK)
+	docker compose -f $(DOCKER_METRICS_COMPOSE) up -d
+
+.PHONY: run-genesis-sync-fsync-on
+run-genesis-sync-fsync-on:
+	RUST_LOG="$(GENESIS_SYNC_RUST_LOG)" MINIMAL_LOG_FORMAT="$(GENESIS_SYNC_MINIMAL_LOG_FORMAT)" $(GENESIS_SYNC_NODE_CMD) \
+		--data-dir "$(GENESIS_SYNC_DATA_DIR_ON)" \
+		--identity-path "$(GENESIS_SYNC_DATA_DIR_ON)/.nockchain_identity" \
+		--bind "/ip4/0.0.0.0/udp/$(GENESIS_SYNC_BIND_PORT_ON)/quic-v1" $(if $(GENESIS_SYNC_PEER),--peer "$(GENESIS_SYNC_PEER)") $(GENESIS_SYNC_COMMON_ARGS) $(GENESIS_SYNC_EXTRA_ARGS)
+
+.PHONY: run-genesis-sync-fsync-off
+run-genesis-sync-fsync-off:
+	RUST_LOG="$(GENESIS_SYNC_RUST_LOG)" MINIMAL_LOG_FORMAT="$(GENESIS_SYNC_MINIMAL_LOG_FORMAT)" $(GENESIS_SYNC_NODE_CMD) \
+		--disable-fsync \
+		--data-dir "$(GENESIS_SYNC_DATA_DIR_OFF)" \
+		--identity-path "$(GENESIS_SYNC_DATA_DIR_OFF)/.nockchain_identity" \
+		--bind "/ip4/0.0.0.0/udp/$(GENESIS_SYNC_BIND_PORT_OFF)/quic-v1" $(if $(GENESIS_SYNC_PEER),--peer "$(GENESIS_SYNC_PEER)") $(GENESIS_SYNC_COMMON_ARGS) $(GENESIS_SYNC_EXTRA_ARGS)
 
 .PHONY: fmt
 fmt:

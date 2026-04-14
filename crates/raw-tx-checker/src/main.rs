@@ -27,17 +27,18 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read {}", args.input.display()))?;
 
     let mut stack = NockStack::new(DEFAULT_STACK_WORDS, 0);
+    let space = stack.noun_space();
     let jam_atom = unsafe {
-        IndirectAtom::new_raw_bytes(&mut stack, jam_bytes.len(), jam_bytes.as_ptr())
-            .normalize_as_atom()
+        let mut atom = IndirectAtom::new_raw_bytes(&mut stack, jam_bytes.len(), jam_bytes.as_ptr());
+        atom.normalize_as_atom_stack()
     };
 
     let hashable = serialization::cue(&mut stack, jam_atom)
         .map_err(|err| anyhow!("failed to cue jammed noun: {err:?}"))?;
-    let digest_noun = hash_hashable(&mut stack, hashable)
+    let digest_noun = hash_hashable(&mut stack, hashable, &space)
         .map_err(|err| anyhow!("hash_hashable jet failed: {err:?}"))?;
 
-    let tip5_hash = Hash::from_noun(&digest_noun)?;
+    let tip5_hash = Hash::from_noun(&digest_noun, &space)?;
     println!("Tip5 limbs (hex):");
     for (idx, limb) in tip5_hash.0.iter().enumerate() {
         let belt_u64 = limb.0;

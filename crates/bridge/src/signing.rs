@@ -5,7 +5,7 @@ use alloy::primitives::{Address, Signature};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use nockapp::nockapp::wire::{Wire, WireRepr};
-use nockvm::noun::Noun;
+use nockvm::noun::{CellMemory, Noun, NounSpace};
 use noun_serde::NounDecode;
 use tracing::info;
 
@@ -31,10 +31,11 @@ impl EthereumSigner {
     /// The proposal_hash is the hash of a bundle proposal that needs to be signed.
     /// This uses EIP-191 message prefix for Ethereum compatibility.
     pub async fn sign_proposal(&self, proposal_hash_noun: Noun) -> Result<Signature, BridgeError> {
-        let proposal_hash = match proposal_hash_noun.as_atom() {
-            Ok(_) => Self::proposal_hash_from_noun(proposal_hash_noun)?,
+        let space = proposal_hash_noun_space(proposal_hash_noun)?;
+        let proposal_hash = match proposal_hash_noun.in_space(&space).as_atom() {
+            Ok(_) => Self::proposal_hash_from_noun(proposal_hash_noun, &space)?,
             Err(_) => {
-                let digest = NounDigest::from_noun(&proposal_hash_noun).map_err(|_| {
+                let digest = NounDigest::from_noun(&proposal_hash_noun, &space).map_err(|_| {
                     BridgeError::Config("proposal-hash noun was not an atom".into())
                 })?;
                 Self::proposal_hash_from_limbs(digest)
@@ -59,8 +60,12 @@ impl EthereumSigner {
     }
 
     /// Convert a cued noun representing a proposal hash into a 32-byte big-endian array
-    pub fn proposal_hash_from_noun(hash_noun: Noun) -> Result<[u8; 32], BridgeError> {
+    fn proposal_hash_from_noun(
+        hash_noun: Noun,
+        space: &NounSpace,
+    ) -> Result<[u8; 32], BridgeError> {
         let atom = hash_noun
+            .in_space(space)
             .as_atom()
             .map_err(|_| BridgeError::Config("proposal-hash noun was not an atom".to_string()))?;
         let mut b = atom.to_be_bytes();
@@ -92,6 +97,59 @@ impl EthereumSigner {
     pub fn address(&self) -> Address {
         self.wallet.address()
     }
+}
+
+fn proposal_hash_noun_space(noun: Noun) -> Result<NounSpace, BridgeError> {
+    let mut ranges = Vec::new();
+    let mut seen = HashSet::new();
+    collect_noun_ranges(noun, &mut ranges, &mut seen)?;
+    Ok(NounSpace::empty().with_extra_ptr_ranges(ranges))
+}
+
+fn collect_noun_ranges(
+    noun: Noun,
+    ranges: &mut Vec<(usize, usize)>,
+    seen: &mut HashSet<usize>,
+) -> Result<(), BridgeError> {
+    if noun.is_direct() {
+        return Ok(());
+    }
+
+    if let Ok(atom) = noun.as_atom() {
+        let Ok(indirect) = atom.as_indirect() else {
+            return Ok(());
+        };
+        let Some(data_ptr) = indirect.data_pointer_stack() else {
+            return Err(BridgeError::Config(
+                "proposal-hash noun uses unsupported offset-form atom".to_string(),
+            ));
+        };
+        let base = data_ptr as usize;
+        if seen.insert(base) {
+            let size_words = unsafe { *(data_ptr.add(1)) as usize };
+            let end = base + (size_words + 2) * std::mem::size_of::<u64>();
+            ranges.push((base, end));
+        }
+        return Ok(());
+    }
+
+    let cell = noun
+        .as_cell()
+        .map_err(|_| BridgeError::Config("proposal-hash noun was neither atom nor cell".into()))?;
+    let Some(ptr) = cell.stack_memory_pointer() else {
+        return Err(BridgeError::Config(
+            "proposal-hash noun uses unsupported offset-form cell".to_string(),
+        ));
+    };
+    let base = ptr as usize;
+    if seen.insert(base) {
+        let end = base + std::mem::size_of::<CellMemory>();
+        ranges.push((base, end));
+        let cell_mem = unsafe { &*ptr };
+        collect_noun_ranges(cell_mem.head, ranges, seen)?;
+        collect_noun_ranges(cell_mem.tail, ranges, seen)?;
+    }
+    Ok(())
 }
 
 /// Bridge signer that only handles Ethereum signatures
@@ -229,6 +287,8 @@ pub fn extract_valid_bridge_addresses(node_config: &NodeConfig) -> HashSet<Addre
 
 #[cfg(test)]
 mod tests {
+    use nockvm::noun::NounAllocator;
+
     use super::*;
 
     #[tokio::test]
@@ -243,7 +303,8 @@ mod tests {
         let noun = unsafe {
             let mut ia =
                 nockvm::noun::IndirectAtom::new_raw_bytes(&mut slab, 32, proposal_hash.as_ptr());
-            ia.normalize_as_atom()
+            let space = slab.noun_space();
+            ia.normalize_as_atom(&space)
         };
         let signature = signer
             .sign_proposal(noun.as_noun())

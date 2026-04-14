@@ -1,5 +1,7 @@
 use wallet_tx_builder::types::CandidateNote;
 
+use nockchain_math::noun_ext::NounMathExtHandle;
+use nockvm::noun::NounSpace;
 use super::*;
 
 pub(crate) fn ensure_manual_planner_parity(
@@ -35,7 +37,7 @@ pub(crate) struct PlannerNoteDataConstantsNoun {
     pub(crate) min_fee: u64,
 }
 
-#[derive(Debug, Clone, NounEncode, NounDecode)]
+#[derive(Debug, Clone, NounEncode)]
 /// Blockchain constants payload extracted from wallet state for planning.
 pub(crate) struct PlannerBlockchainConstantsNoun {
     pub(crate) _v1_phase: u64,
@@ -43,38 +45,35 @@ pub(crate) struct PlannerBlockchainConstantsNoun {
     pub(crate) data: PlannerNoteDataConstantsNoun,
     pub(crate) base_fee: u64,
     pub(crate) input_fee_divisor: u64,
-    pub(crate) _legacy_constants: Noun,
+    pub(crate) coinbase_timelock_min: u64,
 }
 
-#[derive(Debug, Clone, NounEncode, NounDecode)]
-/// Embedded v0 constants payload carried inside wallet blockchain constants.
-struct PlannerV0BlockchainConstantsNoun {
-    _max_block_size: Noun,
-    _blocks_per_epoch: Noun,
-    _target_epoch_duration: Noun,
-    _update_candidate_timestamp_interval: Noun,
-    _max_future_timestamp: Noun,
-    _min_past_blocks: Noun,
-    _genesis_target_atom: Noun,
-    _max_target_atom: Noun,
-    _check_pow_flag: bool,
-    coinbase_timelock_min: u64,
-    _pow_len: Noun,
-    _max_coinbase_split: Noun,
-    _first_month_coinbase_min: Noun,
+impl NounDecode for PlannerBlockchainConstantsNoun {
+    fn from_noun(noun: &Noun, space: &NounSpace) -> Result<Self, NounDecodeError> {
+        let fields = noun.in_space(space).uncell::<6>()?;
+        let legacy_or_timelock = fields[5];
+        let coinbase_timelock_min = if let Ok(value) = u64::from_noun_handle(&legacy_or_timelock) {
+            value
+        } else {
+            let legacy_fields = legacy_or_timelock.uncell::<13>()?;
+            u64::from_noun_handle(&legacy_fields[9])?
+        };
+
+        Ok(Self {
+            _v1_phase: u64::from_noun_handle(&fields[0])?,
+            bythos_phase: u64::from_noun_handle(&fields[1])?,
+            data: PlannerNoteDataConstantsNoun::from_noun_handle(&fields[2])?,
+            base_fee: u64::from_noun_handle(&fields[3])?,
+            input_fee_divisor: u64::from_noun_handle(&fields[4])?,
+            coinbase_timelock_min,
+        })
+    }
 }
 
 impl PlannerBlockchainConstantsNoun {
     /// Returns the consensus coinbase relative timelock minimum.
     pub(crate) fn coinbase_timelock_min(&self) -> Result<u64, NockAppError> {
-        let parsed = PlannerV0BlockchainConstantsNoun::from_noun(&self._legacy_constants).map_err(
-            |err| {
-                NockAppError::OtherError(format!(
-                    "wallet blockchain-constants payload missing coinbase timelock min: {err}"
-                ))
-            },
-        )?;
-        Ok(parsed.coinbase_timelock_min)
+        Ok(self.coinbase_timelock_min)
     }
 }
 
@@ -232,8 +231,9 @@ impl Wallet {
         slab.set_root(path);
 
         let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
         let maybe_balance: Option<Option<v1::BalanceUpdate>> =
-            unsafe { <Option<Option<v1::BalanceUpdate>>>::from_noun(result.root())? };
+            unsafe { <Option<Option<v1::BalanceUpdate>>>::from_noun(result.root(), &space)? };
         match maybe_balance {
             Some(Some(balance)) => Ok(balance),
             _ => Err(NockAppError::OtherError(
@@ -252,8 +252,11 @@ impl Wallet {
         slab.set_root(path);
 
         let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
         let maybe_constants: Option<Option<PlannerBlockchainConstantsNoun>> =
-            unsafe { <Option<Option<PlannerBlockchainConstantsNoun>>>::from_noun(result.root())? };
+            unsafe {
+                <Option<Option<PlannerBlockchainConstantsNoun>>>::from_noun(result.root(), &space)?
+            };
         let Some(constants) = maybe_constants.flatten() else {
             return Err(NockAppError::OtherError(
                 "wallet blockchain-constants peek returned no payload".to_string(),
@@ -289,8 +292,9 @@ impl Wallet {
         slab.set_root(path);
 
         let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
         let maybe_signing_keys: Option<Option<Vec<Hash>>> =
-            unsafe { <Option<Option<Vec<Hash>>>>::from_noun(result.root())? };
+            unsafe { <Option<Option<Vec<Hash>>>>::from_noun(result.root(), &space)? };
         Ok(maybe_signing_keys.flatten().unwrap_or_default())
     }
 
@@ -304,8 +308,9 @@ impl Wallet {
         slab.set_root(path);
 
         let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
         let maybe_signing_pubkeys: Option<Option<Vec<SchnorrPubkey>>> =
-            unsafe { <Option<Option<Vec<SchnorrPubkey>>>>::from_noun(result.root())? };
+            unsafe { <Option<Option<Vec<SchnorrPubkey>>>>::from_noun(result.root(), &space)? };
         Ok(maybe_signing_pubkeys.flatten().unwrap_or_default())
     }
 
@@ -1083,8 +1088,9 @@ impl Wallet {
             request_index = request_index.wrapping_add(1);
 
             let balance = slab.cue_into(response.as_bytes()?)?;
+            let space = slab.noun_space();
             let payload: Option<Option<v1::BalanceUpdate>> =
-                <Option<Option<v1::BalanceUpdate>>>::from_noun(&balance)?;
+                <Option<Option<v1::BalanceUpdate>>>::from_noun(&balance, &space)?;
             results.push(Self::update_balance_grpc_poke_from_payload(payload));
         }
 
@@ -1102,8 +1108,9 @@ impl Wallet {
             request_index = request_index.wrapping_add(1);
 
             let balance = slab.cue_into(response.as_bytes()?)?;
+            let space = slab.noun_space();
             let payload: Option<Option<v1::BalanceUpdate>> =
-                <Option<Option<v1::BalanceUpdate>>>::from_noun(&balance)?;
+                <Option<Option<v1::BalanceUpdate>>>::from_noun(&balance, &space)?;
             results.push(Self::update_balance_grpc_poke_from_payload(payload));
         }
 
