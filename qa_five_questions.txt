@@ -1,0 +1,407 @@
+================================================================================
+Q&A: AI-POW MINER — 5 SPECIFIC TECHNICAL QUESTIONS
+Codebase: nockchain branch claude/ai-pow-integration-squash
+Date: 2026-06-10
+================================================================================
+
+
+================================================================================
+QUESTION 1: Is the ai-pow-miner a standalone binary or embedded in Pearl's
+vLLM plugin? Show the exact binary entry point and Cargo.toml that proves this.
+================================================================================
+
+ANSWER: Standalone binary. There is zero vLLM code in this repository.
+
+A grep for "vllm" across all 1,166 files returned 25 matches — every single one
+is inside crates/plonky3-recursion/circuit/src/ops/*/plugin.rs, which refers to
+Plonky3's circuit "plugin" abstraction, completely unrelated to Python/ML vLLM.
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/Cargo.toml  lines 12-19
+--------------------------------------------------------------------------------
+
+  [[bin]]
+  # Production node-connecting miner. Mirrors `zk-pow-mine` in shape:
+  # connects to a `nockchain` node's private gRPC, subscribes to %mine
+  # effects, mines Pearl-compatible tickets, builds the recursive certificate
+  # after a target hit, and submits the canonical %ai-pow command on %mined.
+  name = "ai-pow-mine"
+  path = "src/bin/ai_pow_mine.rs"
+  required-features = ["node"]
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/src/bin/ai_pow_mine.rs  lines 76-163
+--------------------------------------------------------------------------------
+
+  /// `ai-pow-mine` — standalone AI-PoW block miner.
+  #[derive(Parser, Debug)]
+  #[command(
+      name = "ai-pow-mine",
+      about = "Standalone AI-PoW block miner. Mines Pearl-compatible tickets
+               and submits recursive %ai-pow commands to a nockchain node.",
+      version
+  )]
+  struct Args {
+      /// Node's private gRPC URL.
+      #[arg(long, default_value = "http://127.0.0.1:5555")]
+      node_addr: String,
+
+      /// Single-recipient v1 mining pubkey hash.
+      #[arg(long, conflicts_with = "mining_pkh_adv")]
+      mining_pkh: Option<String>,
+
+      /// Pearl Gateway miner RPC endpoint.
+      #[arg(long, value_name = "ENDPOINT", default_value = DEFAULT_PEARL_GATEWAY_ENDPOINT)]
+      pearl_gateway: String,
+  }
+
+  fn main() -> ExitCode {
+      let args = Args::parse();
+      init_tracing(&args.log);
+
+      let Some(pkh_configs) = build_pkh_configs(&args) else {
+          eprintln!("ai-pow-mine: must supply --mining-pkh <HASH> or \
+                     --mining-pkh-adv \"share,pkh\"");
+          return ExitCode::from(1);
+      };
+      ...
+      let r: Result<(), MinerError> = rt.block_on(async {
+          ...
+          run(cfg, shutdown).await
+      });
+  }
+
+The binary is invoked directly from the command line, e.g.:
+
+  ai-pow-mine \
+      --mining-pkh 9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV
+
+It is not loaded, imported, or called by any Pearl code in this repository.
+
+
+================================================================================
+QUESTION 2: Once the Hoon consensus wiring is complete, would a hyperscaler
+running Pearl's vLLM plugin automatically also mine Nockchain — or would they
+need to separately install, configure and run the ai-pow-miner binary? Show the
+exact code path that proves this.
+================================================================================
+
+ANSWER: They would need to separately install, configure, and run the
+ai-pow-mine binary. It is NOT automatic.
+
+Pearl's vLLM plugin exposes the Gateway JSON-RPC endpoint. That is all Pearl
+does from Nockchain's perspective. The ai-pow-mine binary is an entirely
+separate OS process that must be explicitly started. It connects to TWO
+separate services on startup and coordinates between them:
+
+  1. The Nockchain node (gRPC) — to get block candidates and submit solutions
+  2. The Pearl Gateway (JSON-RPC) — to get Pearl block headers
+
+Neither service starts the other. Neither service starts ai-pow-mine.
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/src/run.rs  lines 398-471
+--------------------------------------------------------------------------------
+
+  pub async fn run(cfg: MinerConfig, shutdown: CancellationToken)
+      -> Result<(), MinerError>
+  {
+      cfg.validate()?;
+      cfg.puzzle.validate_canonical_submission_ready()?;
+
+      loop {
+          // Step 1: Connect to Nockchain node via gRPC
+          let mut client = match NodeClient::connect(&cfg.node_addr).await {
+              Ok(c) => { ... c }
+              Err(e) => {
+                  consecutive_failures += 1;
+                  ...
+                  if consecutive_failures >= cfg.reconnect_max_attempts {
+                      return Err(MinerError::TooManyReconnects { count: ... });
+                  }
+                  ...
+              }
+          };
+
+          // Step 2: Push Nockchain wallet address to node kernel
+          if let Err(e) = client
+              .set_mining_key(
+                  AiPowMinerWire::SetPubKey.to_wire(),
+                  Vec::new(),
+                  cfg.mining_pkh_configs.clone(),
+              )
+              .await
+          {
+              return Err(MinerError::Configure(format!("set_mining_key: {e}")));
+          }
+
+          // Step 3: Subscribe to %mine-ai candidate effects from Nockchain node
+          let mut candidates = match client
+              .watch_candidates(vec![b"mine-ai".to_vec()])
+              .await { ... };
+
+          // Step 4: Enable mining on node
+          if let Err(e) = client
+              .enable_mining(AiPowMinerWire::Enable.to_wire(), true)
+              .await
+          {
+              return Err(MinerError::Configure(format!("enable_mining(true): {e}")));
+          }
+
+Then on each Nockchain candidate, it calls the Pearl Gateway:
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/src/run.rs  lines 889-923
+--------------------------------------------------------------------------------
+
+  fn derive_pearl_merge_job_inputs_from_nockchain(
+      cfg: &MinerConfig,
+      candidate: &NockchainCandidateInputs,
+  ) -> Result<PearlMergeCandidateJob, String> {
+      let pearl = &cfg.puzzle.pearl_merge;
+      let mut aux = pearl.aux_template.clone();
+      // Bind the Nockchain block candidate into the aux commitment
+      aux.nock_block_commitment = candidate.nock_block_commitment;
+      let aux_commitment = aux.commitment()?;
+
+      let (header, gateway_mining_job, aux_inclusion) = {
+          // Call Pearl Gateway getMiningInfo with Nockchain aux embedded
+          let job = fetch_pearl_gateway_mining_job(
+              &pearl.gateway,
+              Some(&aux_commitment)
+          )?;
+          ...
+      };
+
+None of this code runs inside Pearl's vLLM plugin. It must be explicitly
+invoked as a separate process.
+
+
+================================================================================
+QUESTION 3: Does the ai-pow-miner require its own Nockchain wallet address
+configured separately from Pearl's mining address? Show the configuration code.
+================================================================================
+
+ANSWER: Yes. --mining-pkh is a required CLI argument. It is a Nockchain
+pubkey-hash (base58), completely separate from Pearl's mining address. The
+binary refuses to start without it.
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/src/bin/ai_pow_mine.rs  lines 109-116
+--------------------------------------------------------------------------------
+
+  fn main() -> ExitCode {
+      let args = Args::parse();
+      init_tracing(&args.log);
+
+      // Hard failure at startup if no Nockchain wallet address supplied
+      let Some(pkh_configs) = build_pkh_configs(&args) else {
+          eprintln!("ai-pow-mine: must supply --mining-pkh <HASH> or \
+                     --mining-pkh-adv \"share,pkh\"");
+          return ExitCode::from(1);
+      };
+
+--------------------------------------------------------------------------------
+FILE: crates/nockchain-mining-common/src/key_config.rs  lines 39-60
+--------------------------------------------------------------------------------
+
+  #[derive(Debug, Clone)]
+  pub struct MiningPkhConfig {
+      pub share: u64,
+      pub pkh: String,   // Nockchain base58 pubkey-hash, NOT a Pearl address
+  }
+
+  impl FromStr for MiningPkhConfig {
+      fn from_str(s: &str) -> Result<Self, Self::Err> {
+          // Expected format: "share,pkh"
+          let parts: Vec<&str> = s.split(',').collect();
+          let share = parts[0].parse::<u64>()?;
+          let pkh = parts[1].parse::<String>()?;
+          Ok(MiningPkhConfig { share, pkh })
+      }
+  }
+
+The wallet address is sent exclusively to the Nockchain kernel via a
+%set-mining-key-advanced poke, not to Pearl:
+
+--------------------------------------------------------------------------------
+FILE: crates/nockchain-mining-common/src/node_client.rs  lines 69-100
+--------------------------------------------------------------------------------
+
+  pub async fn set_mining_key(
+      &mut self,
+      wire: WireRepr,
+      configs: Vec<MiningKeyConfig>,
+      pkh_configs: Vec<MiningPkhConfig>,
+  ) -> Result<(), NodeClientError> {
+      // v1 (pubkey-hash) configs list pushed to Nockchain kernel
+      let mut pkh_configs_list = D(0);
+      for config in pkh_configs {
+          let pkh_noun = <Atom as AtomExt>::from_value(&mut slab, config.pkh)...
+          // noun: [%command %set-mining-key-advanced configs-list pkh-configs-list]
+      }
+
+Pearl has no awareness of this address. Nockchain coinbase rewards go to
+the configured Nockchain PKH regardless of where Pearl sends its own rewards.
+
+Multi-recipient splits are also supported:
+
+  ai-pow-mine --mining-pkh-adv "2,<pkh1>" "3,<pkh2>"
+
+  // share=2 to pkh1, share=3 to pkh2, proportionally
+
+
+================================================================================
+QUESTION 4: Can Nockchain bundle their miner into Pearl's vLLM plugin without
+Pearl's team cooperation — is there anything in the code that would prevent or
+require Pearl's involvement?
+================================================================================
+
+ANSWER: Nockchain cannot unilaterally bundle INTO Pearl's vLLM plugin (they
+don't have Pearl's source code). However, the interface boundary is extremely
+narrow — just two JSON-RPC methods — so the miner runs as a separate process
+alongside Pearl's plugin with minimal integration surface.
+
+BUT: Pearl's cooperation on the Gateway API is REQUIRED for merge mining to
+work at all. Specifically, Pearl's Gateway must implement:
+
+  1. getMiningInfo with coinbase_aux_flags and return_aux_inclusion parameters
+  2. submitPlainProof
+
+If Pearl does not implement these parameters, merge mining breaks.
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/src/run.rs  lines 993-1058
+--------------------------------------------------------------------------------
+
+  fn fetch_pearl_gateway_mining_job(
+      config: &PearlGatewayMinerRpcConfig,
+      aux_commitment: Option<&[u8; 32]>,
+  ) -> Result<PearlGatewayResolvedMiningJob, PearlGatewayError> {
+      ...
+      let params = match aux_commitment {
+          Some(aux_commitment) => {
+              // Embed Nockchain aux commitment as base64("NOCKCHAIN-AI-POW-AUX" || commitment)
+              coinbase_aux_flags.extend_from_slice(PEARL_NOCKCHAIN_AUX_COMMITMENT_TAG);
+              coinbase_aux_flags.extend_from_slice(aux_commitment);
+              json!({
+                  "coinbase_aux_flags": coinbase_aux_flags,  // Pearl must support this
+                  "return_aux_inclusion": true,              // Pearl must support this
+              })
+          }
+          None => json!({}),
+      };
+      let request = json!({
+          "jsonrpc": "2.0",
+          "method": "getMiningInfo",  // Pearl Gateway API call #1
+          "params": params,
+          "id": request_id,
+      }).to_string();
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/src/run.rs  lines 899-912 (the hard failure)
+--------------------------------------------------------------------------------
+
+  let (header, gateway_mining_job, aux_inclusion) = {
+      let job = fetch_pearl_gateway_mining_job(&pearl.gateway, Some(&aux_commitment))?;
+      let (header, aux_inclusion) = match job.aux_inclusion.clone() {
+          Some(aux_inclusion) => { ... (header, aux_inclusion) }
+          None => {
+              // HARD FAILURE if Pearl Gateway doesn't return aux_inclusion
+              return Err(
+                  "Pearl Gateway response did not include requested aux_inclusion"
+                      .to_string(),
+              );
+          }
+      };
+
+Summary of what requires Pearl's cooperation:
+  - Pearl's Gateway must accept coinbase_aux_flags in getMiningInfo params
+  - Pearl's Gateway must return aux_inclusion in getMiningInfo response
+  - Pearl's Gateway must implement submitPlainProof to accept plain proofs
+  - Pearl's coinbase transaction format must support embedding the
+    "NOCKCHAIN-AI-POW-AUX" commitment in the input script (txid-committed,
+    not witness)
+
+Without Pearl building these features into their Gateway, the miner errors
+out on every single Nockchain candidate and never mines a block.
+
+
+================================================================================
+QUESTION 5: What exactly does the miner need to run simultaneously for merge
+mining to work? List every process/binary that must be running.
+================================================================================
+
+ANSWER: Three processes, all required simultaneously.
+
+  PROCESS 1: nockchain node
+    What:    Nockchain full node with private gRPC interface enabled
+    Default: http://127.0.0.1:5555
+    CLI arg: --node-addr <URL>
+    Role:    Emits %mine-ai block candidates; receives %ai-pow solution pokes;
+             advances the Nockchain chain
+
+  PROCESS 2: Pearl Gateway server
+    What:    Pearl's software exposing getMiningInfo + submitPlainProof JSON-RPC
+    Default: unix:/tmp/pearlgw.sock  (or TCP)
+    CLI arg: --pearl-gateway <ENDPOINT>
+    Role:    Provides Pearl block header (sigma) per refresh interval;
+             accepts Pearl PlainProof submissions; is part of Pearl's
+             infrastructure (likely the vLLM plugin or a sidecar)
+
+  PROCESS 3: ai-pow-mine binary
+    What:    Nockchain's standalone miner
+    CLI:     ai-pow-mine --mining-pkh <NOCKCHAIN_WALLET_HASH>
+    Role:    Coordinates between processes 1 and 2; runs the matmul search;
+             builds the 3-layer ZK recursive certificate; submits to both
+
+--------------------------------------------------------------------------------
+FILE: crates/ai-pow-miner/src/bin/ai_pow_mine.rs  lines 58-106
+--------------------------------------------------------------------------------
+
+  const DEFAULT_PEARL_GATEWAY_ENDPOINT: &str = "unix:/tmp/pearlgw.sock"; // Process 2
+
+  struct Args {
+      #[arg(long, default_value = "http://127.0.0.1:5555")]
+      node_addr: String,      // Process 1 endpoint
+
+      #[arg(long, conflicts_with = "mining_pkh_adv")]
+      mining_pkh: Option<String>, // Nockchain wallet (required, no default)
+
+      #[arg(long, value_name = "ENDPOINT", default_value = DEFAULT_PEARL_GATEWAY_ENDPOINT)]
+      pearl_gateway: String,  // Process 2 endpoint
+  }
+
+WHAT BREAKS IF ANY PROCESS IS MISSING:
+
+  No Nockchain node:
+    NodeClient::connect fails -> MinerError::TooManyReconnects after 5 retries
+    FILE: run.rs lines 416-442
+
+  No Pearl Gateway:
+    fetch_pearl_gateway_mining_job fails -> warning logged ->
+    "could not derive Pearl merge job inputs from candidate; skipping"
+    No work is ever mined because sigma (Pearl header) is unavailable,
+    making kappa derivation impossible.
+    FILE: run.rs lines 518-525
+
+  No --mining-pkh:
+    Binary exits with code 1 at startup before connecting to anything.
+    FILE: ai_pow_mine.rs lines 113-116
+
+DATA FLOW BETWEEN THE THREE PROCESSES:
+
+  Nockchain node  --[%mine-ai candidate: block_header, target]--> ai-pow-mine
+  Pearl Gateway   --[getMiningInfo: incomplete_header, aux_inclusion]--> ai-pow-mine
+  ai-pow-mine     --[matmul + ZK proof]--> Nockchain node (%ai-pow poke)
+  ai-pow-mine     --[submitPlainProof]--> Pearl Gateway (Pearl block reward)
+
+Pearl's vLLM plugin runs Pearl's normal AI inference workload AND exposes the
+Gateway socket as a side effect. The ai-pow-mine binary attaches to that socket
+as a second client alongside whatever Pearl-native miners Pearl runs internally.
+Pearl's miners earn Pearl rewards; ai-pow-mine additionally earns Nockchain
+rewards from the same matmul work.
+
+================================================================================
+END OF Q&A
+================================================================================
