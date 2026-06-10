@@ -1,0 +1,658 @@
+================================================================================
+NOCKCHAIN AI-POW / PEARL INTEGRATION — COMPLETE TECHNICAL SUMMARY
+================================================================================
+Branch: claude/ai-pow-integration-squash
+Date of analysis: 2026-06-10
+================================================================================
+
+REPOSITORY STRUCTURE
+--------------------
+
+32 Rust crates, Hoon kernel code, and 7+ AI-PoW integration docs.
+
+Key crates:
+
+  crates/ai-pow               Core library: matmul, noise, prover, verifier,
+                              Pearl compat, ZK bridge
+  crates/ai-pow-miner         Miner binary: Pearl gateway polling, ticket
+                              search, cert construction, poke submission
+  crates/ai-pow-zk            ZK circuit: Layer-0 composite STARK,
+                              Layer-1 Tip5 recursive, Layer-2 BLAKE3
+  crates/nockchain-mining-common  Shared mining substrate
+  hoon/apps/dumbnet/lib/consensus.hoon
+                              Full Nockchain consensus, including Stage 6
+                              %ai-pow dispatch
+
+Key source files read:
+
+  crates/ai-pow/src/pearl_compat.rs   (1984 lines)
+  crates/ai-pow/src/matmul.rs         (863 lines)
+  crates/ai-pow/src/prover.rs         (542 lines)
+  crates/ai-pow/src/fiat_shamir.rs    (302 lines)
+  crates/ai-pow/src/tile_hash.rs      (202 lines)
+  crates/ai-pow/src/verifier.rs       (481 lines)
+  crates/ai-pow/src/params.rs         (1066 lines)
+  crates/ai-pow-miner/src/pearl_mining.rs   (613 lines)
+  crates/ai-pow-miner/src/pearl_plain_proof.rs  (549 lines)
+  crates/ai-pow-miner/src/certificate_noun.rs   (6931 lines)
+  crates/ai-pow-miner/src/wire.rs     (57 lines)
+  crates/ai-pow-miner/src/run.rs      (4330 lines, partial)
+  crates/ai-pow-zk/src/lib.rs         (155 lines)
+  crates/ai-pow/tests/pearl_merge_compat.rs  (2261 lines)
+  hoon/apps/dumbnet/lib/consensus.hoon (1167 lines)
+  hoon/common/tx-engine-1.hoon        (partial)
+  docs/ai-pow-integration/2026-06-01_PEARL_MERGE_MINING_COMPATIBILITY_SPEC.md
+  docs/ai-pow-integration/2026-06-01_AI_POW_PEARL_SPEC_MATCH_AND_MINEABLE_UNIT.md
+  docs/ai-pow-integration/2026-05-31_AI_POW_ONE_MATMUL_ONE_ATTEMPT_AUDIT.md
+  docs/ai-pow-integration/2026-05-29_AI_ZKP_NOUN_WIRE_SPEC.md
+  crates/ai-pow-zk/docs/2026-06-07_COMPACT_RECURSIVE_PRODUCTION_PIPELINE.md
+
+
+================================================================================
+QUESTION 1: HOW EXACTLY IS PEARL'S WORK ATTEMPT BEING REUSED?
+================================================================================
+
+Short answer: Matrices A and B are committed once per (sigma, mu) block template.
+The search loop only varies (t_rows, t_cols) offsets — selecting different
+row/column strips from the already-committed and noised matrices. This IS Pearl's
+intended lottery model.
+
+EXACT COMMITMENT CHAIN
+-----------------------
+Source: crates/ai-pow/src/fiat_shamir.rs, crates/ai-pow/src/prover.rs:BlockContext::build
+
+  attempt_state = block_state(block_commitment, nonce)
+                = len(block_commitment) || block_commitment || len(nonce) || nonce
+
+  kappa         = BLAKE3(attempt_state || params_tag)     // commitment_key()
+
+  HASH_A        = BLAKE3(pad(A_row_major), key=kappa)     // matrix_commitment()
+  HASH_B        = BLAKE3(pad(B_col_major), key=kappa)
+
+  s_B           = BLAKE3(kappa || HASH_B)                 // noise_seed_b()
+  s_A           = BLAKE3(s_B || HASH_A)                   // noise_seed_a()
+
+  pow_key       = BLAKE3_derive("ai-pow v3 pow-key",
+                    s_A || len(nonce) || nonce)
+
+For Pearl-compatible merge mining (pearl_compat.rs):
+  - sigma = Pearl incomplete block header (76 bytes), which contains the
+            Nockchain block commitment embedded in the coinbase/aux
+  - mu    = Pearl mining configuration (52 bytes)
+  - The Pearl jackpot key IS s_A directly (not pow_key_for_nonce), matching
+    Pearl's BLAKE3(M_ticket, key=s_A)
+
+PER-ATTEMPT TICKET SELECTION
+------------------------------
+Source: crates/ai-pow/src/pearl_compat.rs:compute_pearl_pattern_ticket
+        crates/ai-pow-miner/src/pearl_mining.rs:run
+
+PatternOffsetSpace enumerates valid (t_rows, t_cols) pairs.
+For each pair:
+  1. Select row indices from rows_pattern.shifted(t_rows)
+     — a periodic subset of A' rows
+  2. Select col indices from cols_pattern.shifted(t_cols)
+     — a periodic subset of B' columns
+  3. Run compute_pattern_tile_trace_from_slices(a_strips, b_strips, params)
+     -> TileState M   (512-bit rolling state: 16 x i32)
+  4. Jackpot hash: BLAKE3(M, key=s_A)
+  5. Check jackpot hash against Pearl-adjusted target AND
+     Nockchain-adjusted target independently
+
+WORK FACTOR / TARGET ADJUSTMENT
+---------------------------------
+Both targets are multiplied by:
+  dot_product_length × h × w
+
+where:
+  dot_product_length = k - (k % rank)   (stripes of length rank up to k)
+  h = rows_pattern.size()
+  w = cols_pattern.size()
+
+This scales the raw base target to price the real work performed by one ticket.
+
+TILESTATE MECHANICS
+--------------------
+Source: crates/ai-pow/src/matmul.rs
+
+  TileState = [i32; 16]   (16-word, 512-bit rolling state)
+
+  fold(step, x):
+    M[step % 16] = rotl13(M[step % 16]) XOR x_step
+
+  Per-stripe of the noised matmul:
+    - Take t rows of (A+E) and t cols of (B+F)
+    - Accumulate t×t i32 block
+    - XOR all entries into scalar x
+    - fold(step, x) into M
+
+  keyed_hash(pow_key):
+    BLAKE3(M_as_64_bytes, key=pow_key)
+
+LOW-RANK NOISE
+---------------
+Source: crates/ai-pow/src/matmul.rs:BlockNoise::expand
+
+  E = E_L * E_R    (left and right factors, m×r and r×k)
+  F = F_L * F_R    (left and right factors, k×r and r×n)
+  Generated from s_A (for E) and s_B (for F)
+  Entry range: i8, |A+E| <= 127, |B+F| <= 127
+
+CRITICAL SECURITY FIX
+-----------------------
+Source: docs/ai-pow-integration/2026-05-31_AI_POW_ONE_MATMUL_ONE_ATTEMPT_AUDIT.md
+        crates/ai-pow/src/prover.rs
+
+Pre-fix vulnerability: BlockContext::build took no nonce parameter. It cached
+s_A and tile states, then mine_inner applied pow_key_for_nonce(s_A, nonce) as
+the final hash key. ONE expensive matmul precomputation could be reused for
+MANY cheap nonce trials — a PoW soundness bug.
+
+Fix applied: Nonce is now included in attempt_state BEFORE kappa is derived.
+Every new nonce attempt forces:
+  fresh kappa -> HASH_A -> HASH_B -> s_A -> noise -> matrices -> tile states
+
+BlockContext fields are now crate-private; external access only via read-only
+getters. Diagnostic accessors carry explicit comments forbidding cross-nonce
+reuse. The legacy NCMN miner path (which had the bug) was removed entirely;
+only the Pearl-compatible path remains.
+
+
+================================================================================
+QUESTION 2: DOES NOCKCHAIN'S ZK PROOF WRAP PEARL'S OR REPLACE IT?
+================================================================================
+
+REPLACES. Completely independent proof system.
+
+PEARL'S PROOF SYSTEM (not used by Nockchain)
+---------------------------------------------
+  - Plonky2 three-layer recursive stack
+  - Target: ~60 KB compact proofs
+  - Pearl submits PlainProof (block-opening proof for one tile's row/column
+    openings) to Pearl Gateway via submitPlainProof
+  - This JSON-RPC submission never touches Hoon or Nockchain consensus
+
+NOCKCHAIN'S ZK PROOF SYSTEM (3-layer STARK)
+---------------------------------------------
+Source: crates/ai-pow-zk/src/lib.rs
+        crates/ai-pow-zk/docs/2026-06-07_COMPACT_RECURSIVE_PRODUCTION_PIPELINE.md
+
+Layer 0 — Useful-Work STARK
+  What:      AI-PoW useful-work statement for one Pearl-compatible ticket
+  System:    Plonky3 composite batch-STARK over Goldilocks + Tip5 MMCS
+             with 7 LogUp buses (CompositeFullAirWithLookupsPinned)
+  Soundness: 60 FRI query bits (log_blowup=4, 15 queries, pow=0)
+  Key chips: MatmulChip, StripeXorChip, FoldChip, Blake3Chip, JackpotRotChip
+
+Layer 1 — Tip5 Recursive Proof
+  What:      Recursive verification of Layer-0 proof inside a Tip5 circuit
+  System:    In-circuit Tip5 permutation verifier; computes Tip5 digest
+             over Layer-0 public values; exposes digest as binding lanes
+  Soundness: 60 FRI query bits (log_blowup=3, 20 queries, cap_height=4, pow=0)
+
+Layer 2 — Native BLAKE3 Final STARK
+  What:      Recursive verification of Layer-1 proof
+  System:    Native BLAKE3 outermost STARK; binds Layer-1 statement digest
+             as 10 base-field public binding lanes (DIGEST_ELEMS=5, ext_degree=2)
+  Params:    log_blowup=5
+
+COMPACT PRODUCTION OUTPUT
+--------------------------
+  Full jammed %ai-pow artifact:                 125,382 bytes
+  Compact recursive certificate inside artifact: 124,570 bytes
+  Full cold artifact build wall time:             31.837s
+  Accepted relaxed target:                        ~150 KB, ~32s, 60-bit soundness
+
+LAYER-0 SOUNDNESS BINDING
+---------------------------
+Source: crates/ai-pow-zk/docs/2026-06-07_COMPACT_RECURSIVE_PRODUCTION_PIPELINE.md
+
+  - The canonical program is derived by the VERIFIER from public parameters
+    and strip schedule — NOT supplied by the prover
+  - BLAKE3 strip-opening rows authenticate opened A/B strips to HASH_A/HASH_B
+  - noised_packed LogUp bus binds matmul reads to committed plain bytes
+    plus verifier-derived noise
+  - Useful-work chain runs: matmul sweep -> StripeXor reduction -> fold chain
+    -> final tile-state construction -> jackpot BLAKE3 block
+  - The old off-circuit tile-computation fallback was removed; in-circuit
+    sweep is the only matmul path
+
+A malicious miner cannot fabricate x_steps, swap cheaper strips, or skip
+the matrix multiplication without breaking the Layer-0 AIR or LogUp relations.
+
+LAYER-0 PUBLIC INPUTS (60 Goldilocks field elements)
+------------------------------------------------------
+Source: crates/ai-pow-zk/src/composite_public.rs
+
+  cumsum[4]          accumulated matmul result (4 limbs)
+  jackpot[16]        final TileState (16 x i32, as field elements)
+  hash_a[8]          HASH_A commitment
+  hash_b[8]          HASH_B commitment
+  job_key[8]         kappa
+  commitment_hash[8] s_A (Pearl jackpot key)
+  hash_jackpot[8]    BLAKE3(tile_state, key=s_A)
+
+The verifier derives expected public inputs from trusted attempt data and
+rejects mismatches before constructing the recursive certificate input.
+
+PROOF ARTIFACTS: WHAT GOES WHERE
+----------------------------------
+  Pearl PlainProof      -> Pearl Gateway JSON-RPC submitPlainProof
+                           (never enters Hoon)
+  Nockchain recursive   -> %command %pow %ai-pow [nonce cert]
+  certificate             poked to Nockchain node
+                           (Hoon sees nonce as opaque [len data] atom)
+
+
+================================================================================
+QUESTION 3: DOES A MINER NEED PEARL SOFTWARE?
+================================================================================
+
+Partially. No Pearl software needed for computation. A Pearl Gateway server
+IS required as a work-template source and submission endpoint.
+
+WHAT NOCKCHAIN'S ai-pow-miner PROVIDES NATIVELY
+-------------------------------------------------
+Source: crates/ai-pow/src/pearl_compat.rs
+        crates/ai-pow-miner/src/pearl_mining.rs
+        crates/ai-pow-miner/src/pearl_plain_proof.rs
+
+  - All Pearl matmul logic:
+      derive_pearl_work_commitments  (kappa -> HASH_A/B -> s_A/s_B)
+      compute_pearl_pattern_ticket   (select strips, run tile, jackpot hash)
+      evaluate_pearl_merge_ticket_attempt  (check both targets)
+      mine_pearl_merge_ticket_attempt      (return on Nockchain hit)
+  - PatternOffsetSpace: full enumeration of valid (t_rows, t_cols) pairs
+  - Pearl wire format construction:
+      AIP1 nonce envelope
+      PMP1 public statement
+      NPA1 aux bytes
+  - PearlPlainProof: serialization as base64(bincode-1.3.3) for submitPlainProof
+  - Nockchain's own 3-layer ZK proof stack (independent of Pearl's Plonky2)
+  - PearlMergeMiningJob: bundles header, config, params, target, A/B matrices,
+    max_pattern_len, aux (with pre-set nock_block_commitment)
+
+WHAT REQUIRES PEARL GATEWAY (JSON-RPC)
+----------------------------------------
+Source: crates/ai-pow-miner/src/run.rs
+        docs/ai-pow-integration/2026-06-01_PEARL_MERGE_MINING_COMPATIBILITY_SPEC.md
+
+  getMiningInfo
+    Provides: Pearl incomplete block header (76 bytes = sigma),
+              mining configuration (mu), aux commitment embedding slot
+    The miner embeds "NOCKCHAIN-AI-POW-AUX" || aux_commitment in the
+    coinbase_aux_flags field to pre-commit the Nockchain block BEFORE
+    kappa is derived
+    Refresh interval: 1000ms
+    Request timeout:  2000ms
+
+  submitPlainProof
+    Submits Pearl-format PlainProof for Pearl target hits
+    Earns Pearl block rewards (separate from Nockchain rewards)
+
+  Transport: Unix socket or TCP
+  Response line cap: 160 KiB
+
+MINER LOOP SUMMARY (crates/ai-pow-miner/src/run.rs:run)
+----------------------------------------------------------
+  1. Connect to Nockchain node via gRPC
+  2. Poll Pearl Gateway getMiningInfo (1s interval)
+  3. Receive Nockchain candidate block from node stream
+  4. Compute nock_block_commitment = BLAKE3(jam(candidate.block_header))
+  5. Build PearlMergeMiningJob (binds nock_block_commitment in aux)
+  6. Enumerate PatternOffsetSpace; for each (t_rows, t_cols):
+       a. Evaluate ticket against Pearl target and Nockchain target
+       b. Pearl-only hit: submit PlainProof to Gateway;
+                          keep Nockchain candidate; resume on next Pearl work
+       c. Nockchain hit: build 3-layer recursive ZK cert;
+                         poke node %command %pow %ai-pow;
+                         clear candidate; request new candidate
+       d. Both hit: submit to both; clear both
+  7. Cache prover between runs (PearlMergeSubmissionConfig::new_compact_recursive)
+
+
+================================================================================
+QUESTION 4: WHAT DOES "SETTLES NOCKCHAIN" MEAN TECHNICALLY?
+================================================================================
+
+Pearl matmul IS Nockchain's consensus PoW function. This is not a side reward.
+
+WHEN A NOCKCHAIN BLOCK IS VALID
+---------------------------------
+When the Pearl jackpot hash clears the Nockchain-adjusted target:
+
+  BLAKE3(TileState, key=s_A)  <=  nockchain_adjusted_target
+
+That is a valid Nockchain block proof. The miner pokes the node, the node
+accepts the block candidate, and the chain advances.
+
+CHAIN OF CRYPTOGRAPHIC PRE-COMMITMENT
+---------------------------------------
+Source: crates/ai-pow-miner/src/run.rs:derive_job_inputs
+        crates/ai-pow/src/pearl_compat.rs:PearlNockchainAux
+
+  1. Nockchain constructs candidate block (header + txs)
+  2. Miner: nock_block_commitment = BLAKE3(jam(block_header))
+             (32-byte BLAKE3 of the jammed Hoon noun)
+  3. nock_block_commitment -> PearlNockchainAux -> NPA1 wire format
+     -> coinbase input script of the Pearl block being mined
+     (field: coinbase_aux_flags in getMiningInfo response)
+  4. sigma = Pearl incomplete header bytes, which NOW contains the
+             coinbase that contains the Nockchain aux commitment
+  5. kappa = BLAKE3(sigma || mu)
+     This cryptographically binds the Nockchain candidate to Pearl's
+     work instance
+  6. All downstream values (HASH_A, HASH_B, s_A, noise, tile states)
+     derive from this committed sigma
+
+SECURITY CONSEQUENCE:
+A miner cannot find a valid Pearl tile ticket and then CHOOSE which Nockchain
+block to claim it for. The Nockchain block was committed before kappa was derived.
+Changing the Nockchain block candidate requires restarting the entire Pearl
+work instance from scratch.
+
+VERIFICATION PATH
+------------------
+Source: crates/ai-pow-miner/src/certificate_noun.rs:precheck_ai_pow_pearl_merge_artifact_statement
+        crates/ai-pow/src/pearl_compat.rs:verify_pearl_merge_public_statement_bytes
+
+  Step 1 (cheap gate, no ZK):
+    precheck_ai_pow_pearl_merge_artifact_jam
+      - Cap jam bytes (default max: 4 MB)
+      - Preflight the noun (bound depth, node count, atom size)
+      - Cue and canonicalize the jam
+      - Decode only opaque nonce + certificate METADATA (no recursive proof)
+      - verify_pearl_aux_inclusion: re-derive kappa, HASH_A, HASH_B, s_A;
+        verify Pearl coinbase contains "NOCKCHAIN-AI-POW-AUX" || aux_commitment
+        in the txid-committed coinbase input script (not witness)
+      - Check jackpot hash <= Nockchain-adjusted target
+      - Check certificate metadata fields match re-derived Pearl work
+
+  Step 2 (expensive, when verifier is wired):
+    verify_compact_batch_recursive_certificate_with_context
+      - Verify the 3-layer STARK recursive certificate
+      - Context (verifier-key digest, setup) comes from verifier-owned
+        configuration, NOT the miner-controlled artifact
+
+HOON CONSENSUS STATUS
+-----------------------
+Source: hoon/apps/dumbnet/lib/consensus.hoon:validate-page-without-txs
+
+  check-pow-hash:
+    =/  pow  (need ~(pow get:page:t pag))
+    ?:  ?=([%ai-pow *] pow)
+      ::  Fail closed until recursive AI-PoW certificate verification is
+      ::  wired. A typed certificate is not itself a target check.
+      %.n                         <-- ALWAYS REJECTS currently
+    =/  prf=proof:sp  (need ((soft proof:sp) pow))
+    %-  check-target:mine
+    :_  ~(target get:page:t pag)
+    (proof-to-pow:t prf)
+
+  This is a deliberate milestone decision, not a bug. Real recursive
+  verifier wiring is out of scope for the current milestone.
+
+ASERT DIFFICULTY ADJUSTMENT
+-----------------------------
+Source: hoon/apps/dumbnet/lib/consensus.hoon:compute-target-ai-asert
+        compute-target-zk-asert
+
+Post-activation, AI blocks use compute-target-ai-asert:
+  - Separate aserti3-2d ASERT algorithm with its own anchor height,
+    anchor target, and ideal block time (ai-asert.blockchain-constants)
+  - Independent of ZK block difficulty
+
+ZK blocks use compute-target-zk-asert:
+  - Two regimes: zk-asert (150s ideal) and zk-asert-post-ai (300s)
+  - ZK ideal block time slows down post-AI-activation to make room
+
+Per-puzzle target computation uses find-same-type-ancestor to walk only
+same-type blocks for median timestamp and ASERT parent-digest, avoiding
+cross-puzzle difficulty interference.
+
+NOTE: compute-target-ai-asert currently uses global parent (not per-puzzle
+parent) — this is a known TODO in the code. Will be fixed when Stage 6
+per-puzzle subchain walker is wired.
+
+STAGE 6 ACTIVATION (hoon/apps/dumbnet/lib/consensus.hoon)
+-----------------------------------------------------------
+  version-to-puzzle-type:
+    %0/%1/%2  ->  %dumb-zkpow   (ZK STARK PoW)
+    %3        ->  %ai-pow       (AI PoW)
+
+  proof-version-valid-at-height:
+    pre-activation:   must equal height-derived legacy ZK version only
+    post-activation:  %3 (AI) OR legacy ZK version both valid
+
+  Activation height: ai-pow-activation-height (mainnet: 95000)
+  Fakenet override: 2 (low height for testing)
+
+  accept-block stores the proof version in block-versions map for
+  all post-activation blocks so puzzle type can be recovered without
+  re-parsing the proof artifact.
+
+
+================================================================================
+KEY DATA STRUCTURES
+================================================================================
+
+AIP1 NONCE WIRE FORMAT
+-----------------------
+Source: crates/ai-pow-miner/src/certificate_noun.rs:encode_pearl_merge_ai_pow_nonce
+        docs/ai-pow-integration/2026-06-01_PEARL_MERGE_MINING_COMPATIBILITY_SPEC.md
+
+  Byte layout:
+    magic[4]             = "AIP1"
+    statement_len[2]     = u16 LE
+    PMP1_statement:
+      magic[4]           = "PMP1"
+      incomplete_header[76]   Pearl block header without nonce/proof fields
+      public_data[164]        PearlPublicProofParams (config + pattern params)
+      expected_aux[32]        BLAKE3("nockchain-ai-pow-aux-v1" || aux_bytes)
+      aux_len[2]         = u16 LE
+      aux_bytes:
+        NPA1:
+          magic[4]       = "NPA1"
+          chain_id_len[1]
+          chain_id       = b"nockchain"
+          nock_block_commitment[32]  = BLAKE3(jam(candidate_block_header))
+          target_epoch_or_height[8]  = u64 LE
+          extra_len[2]
+          extra_data     = []
+    coinbase_tx_len[4]   = u32 LE
+    coinbase_tx          = full Pearl coinbase transaction bytes
+    merkle_branch_len[1]
+    merkle_branch        = N x 32-byte hashes (0 for coinbase-only blocks)
+
+  Max total size: 101,424 bytes (pinned by Rust tests)
+
+PEARL WORK STRUCTURES (crates/ai-pow/src/pearl_compat.rs)
+----------------------------------------------------------
+
+  PearlIncompleteBlockHeader  76 bytes  Pearl block header template
+  PearlMiningConfig           52 bytes  Dimensions, rank, difficulty
+  PearlPublicProofParams     164 bytes  rows_pattern, cols_pattern, t_rows,
+                                        t_cols, hash_a, hash_b, hash_jackpot
+  PearlWorkCommitments             h_a (32B), h_b (32B)  (chunk commitments)
+  PearlNockchainAux                chain_id, nock_block_commitment[32],
+                                   target_epoch_or_height, extra_domain_data
+  PearlAuxInclusionProof           coinbase_tx, merkle_branch
+
+  Constants:
+    PEARL_NOCKCHAIN_AUX_DOMAIN = b"nockchain-ai-pow-aux-v1"
+    PEARL_NOCKCHAIN_AUX_MAGIC  = *b"NPA1"
+    PEARL_MERGE_PUBLIC_STATEMENT_MAGIC = *b"PMP1"
+
+HOON AI-POW TYPES (hoon/common/tx-engine-1.hoon)
+-------------------------------------------------
+
+  +$  ai-blake    @uxblake   -- 32-byte BLAKE3 digest, LE atom bytes
+  +$  ai-pow-nonce  [len=@ud data=@uxaipownonce]  -- opaque Rust-owned bytes
+
+  +$  ai-pow-commitments
+    $:  h-a-chunk=ai-blake
+        h-b-chunk=ai-blake
+    ==
+
+  +$  ai-pow-public-inputs
+    $:  cumsum=[c0=@sd c1=@sd c2=@sd c3=@sd]
+        jackpot=[j0 j1 j2 j3 j4 j5 j6 j7 j8 j9 j10 j11 j12 j13 j14 j15]
+        hash-a=ai-blake
+        hash-b=ai-blake
+        job-key=ai-blake
+        commitment-hash=ai-blake      ::  s_A (Pearl jackpot key)
+        hash-jackpot=ai-blake
+    ==
+
+  +$  ai-pow-certificate
+    $:  version=@ud                   ::  currently 1
+        params=[m k n noise-rank tile difficulty-bits]
+        found-idx=@ud
+        trace-height=@ud
+        commitments=ai-pow-commitments
+        public-inputs=ai-pow-public-inputs
+        certificate=ai-recursive-certificate  ::  compact bytes (AiProofNode::Bytes)
+    ==
+
+  +$  ai-pow-artifact
+    $:  nonce=ai-pow-nonce
+        certificate=ai-pow-certificate
+    ==
+
+  Block submission command shape:
+    [%command %pow [%ai-pow nonce=ai-pow-nonce cert=ai-pow-certificate]]
+
+MATMUL PARAMETERS
+------------------
+Source: crates/ai-pow/src/params.rs
+
+  Name              m      k      n    rank  tile  spot  Security
+  TEST_SMALL        64     64     64      4     8     8   Sub-envelope (NOT consensus-valid)
+  PROD            4096   4096   4096     64     8    80   Pearl §4.8 valid
+  LLAMA_3_1_8B    4096   4096  14336     64     8    80   Pearl §4.8 valid (gate_up/up_proj)
+
+  Pearl §4.8 security envelope:
+    r in {32..1024}
+    16r <= k <= 4r^2
+    64 | k
+    h*w in [32, 256]
+    STRIPE_MAX = 64 (in-circuit matmul sweep capacity)
+    SPOT_CHECKS_MAX = 256 (DoS cap)
+
+  LlamaFfnLayer:
+    GateProj, UpProj, OProj  -- INT7 (group_1), mineable
+    DownProj                 -- FP8 (group_0), NOT mineable
+    AttnQkv layers 0-15      -- FP8 (group_0), NOT mineable
+    AttnQkv layers 16+       -- INT7 (group_1), mineable
+
+ZK ARTIFACT PRODUCTION PATH
+-----------------------------
+Source: crates/ai-pow-miner/src/certificate_noun.rs
+
+  pearl_merge_recursive_certificate_parts_from_ticket
+    -> validates ticket matches re-derived Pearl work
+    -> rejects non-winning tickets, forged statements, bad geometries
+    -> derives: zk_params, found_idx, strip_schedule, trace_height,
+                commitments (h_a_chunk, h_b_chunk), public_inputs
+
+  build_ai_pow_pearl_merge_artifact_noun_from_ticket_compact_recursive_run
+    -> runs the above
+    -> validates aux_inclusion
+    -> checks run.zk_params, found_idx, strip_schedule,
+       trace_height, commitments all match re-derived parts
+    -> encodes as NounSlab:
+         [%ai-pow [len data] [version params found-idx trace-height
+                              [h-a-chunk h-b-chunk]
+                              [cumsum jackpot hash-a hash-b job-key
+                               commitment-hash hash-jackpot]
+                              certificate-bytes]]
+
+CERTIFICATE NOUN LIMITS (default)
+-----------------------------------
+  max_depth:        256
+  max_total_nodes:  1,000,000
+  max_list_items:   1,000,000
+  max_atom_bytes:   1 MB
+  max_packed_items: 1,000,000
+  max_jam_bytes:    4 MB
+
+
+================================================================================
+REMAINING IMPLEMENTATION GAPS
+================================================================================
+
+  Gap                                Status
+  -------------------------------------------------------------------------------
+  Hoon check-pow-hash for %ai-pow    Fail-closed (%.n) — deliberate milestone
+                                     decision, not a bug
+  Recursive verifier wiring in       Not yet wired; no consensus-acceptance
+  Hoon / jets                        tests exist
+  Full-matmul recursive statement    Current recursive cert proves ONE selected
+                                     tile; production block admission remains
+                                     closed until recursive statement binds a
+                                     full-matmul aggregate or full-work cert
+  COMMITMENT_HASH public-input name  Should be documented as nonce-derived
+                                     jackpot key s_A to avoid Pearl confusion
+  Per-puzzle ASERT parent walk       compute-target-ai-asert uses global parent
+                                     (TODO in code); will walk AI-only ancestors
+                                     post-Stage-6 wiring
+  TEST_SMALL r=4 envelope violation  Explicitly not consensus-valid; used for
+                                     fast unit tests only
+  Pearl §4.8 admission for           Broad explicit-schedule tests exist for
+  non-square tile shapes             contiguous, non-contiguous, rectangular
+                                     patterns; future refactors must not
+                                     silently narrow Pearl admission
+  Plain MatmulProof                  Remains as a diagnostic/pre-ZKP check;
+                                     must NOT be treated as a production block
+                                     proof
+  h_a / h_b (row/column Merkle       Still present in MatmulProof for spot-check
+  opening roots)                     diagnostics; NOT canonical commitment
+                                     parameters (only h_a_chunk / h_b_chunk are)
+
+
+================================================================================
+SECURITY PROPERTIES THAT ARE WORKING
+================================================================================
+
+1. Grinding attack closed:
+   Nonce is included in sigma before kappa derivation. Every new nonce attempt
+   requires fresh kappa, noise, matrices, and tile states. One matmul precomp
+   cannot be reused for many cheap Nockchain trials.
+
+2. Nockchain block pre-commitment:
+   nock_block_commitment is embedded in Pearl coinbase BEFORE mining starts.
+   A miner cannot retroactively assign a found ticket to a different block.
+
+3. No independent Nockchain nonce grinding:
+   AIP1 nonce is opaque but must carry a Pearl-valid public statement and aux
+   evidence. Any attempt to add a cheap inner nonce that only keyed the final
+   BLAKE3 jackpot hash (without Pearl work) is rejected by the precheck.
+
+4. Pearl public proof parameters are public:
+   t_rows/t_cols select an opened tile from the COMMITTED work instance.
+   They do not introduce new entropy before kappa. Changing offsets changes
+   the opened tile but NOT the committed matrices or noise.
+
+5. ZK statement precheck:
+   verify_pearl_merge_public_statement_bytes re-derives kappa, s_A, s_B,
+   HASH_A, HASH_B, trace height, target satisfaction, and submitted ticket
+   metadata before accepting the recursive certificate metadata.
+
+6. Canonical commitment surface:
+   Only [h_a_chunk, h_b_chunk] are canonical production commitments (bound
+   by the recursive ZK proof). Legacy row/column opening roots h_a/h_b exist
+   only in diagnostic MatmulProof and do not appear in consensus artifacts.
+
+7. DoS-resistant precheck:
+   Cheap statement precheck gates before expensive proof traversal:
+     - Jam byte cap (4 MB default)
+     - Noun depth and node count bounds
+     - Target miss rejection before ZK
+     - Metadata tamper rejection before ZK
+   challenge_indices uses HashSet (O(count) memory) not bool vector,
+   preventing memory-exhaustion with crafted huge range values.
+
+
+================================================================================
+END OF SUMMARY
+================================================================================
