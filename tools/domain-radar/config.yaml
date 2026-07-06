@@ -1,0 +1,39 @@
+# Sources this pipeline watches. Edit this list -- it's the one thing
+# you're expected to tune over time.
+
+reddit:
+  subreddits:
+    - LocalLLaMA
+    - MachineLearning
+    - startups
+    - SideProject
+    - artificial
+  # how far back to look on each run, in hours
+  lookback_hours: 6
+  # only consider posts/comments with at least this much engagement
+  min_score: 5
+
+youtube:
+  # channel IDs (not handles) for podcasts/shows likely to coin new terms first.
+  # find a channel ID via view-source on the channel page, look for "channelId".
+  channels:
+    - UCbY9xX3_jkeuMHdA2z9cegg  # Lex Fridman
+    - UCJIfeSCssxSC_Dhc5s7lpqQ  # placeholder - replace with real channel IDs
+  lookback_hours: 48
+
+domains:
+  tlds:
+    - com
+    - io
+    - ai
+    - co
+    - dev
+
+scoring:
+  # minimum confidence score (0-100) before a term makes it into the digest
+  digest_threshold: 60
+  # minimum number of distinct mentions before a term is even considered
+  min_mentions: 2
+
+digest:
+  max_signals_per_run: 5
