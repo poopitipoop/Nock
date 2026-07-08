@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pearl (PRL) — Proof-of-Useful-Work for the AI Compute Era</title>
+<meta name="description" content="Pearl is a Proof-of-Useful-Work L1 that turns AI matrix multiplication into mining. Every block is pearlified: raw GPU compute, wrapped in cryptographic noise, ground into money.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="grain-overlay" aria-hidden="true"></div>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a href="#top" class="logo">
+      <span class="logo-mark" aria-hidden="true">
+        <svg viewBox="0 0 40 40" width="28" height="28">
+          <defs>
+            <radialGradient id="logoPearl" cx="35%" cy="30%" r="75%">
+              <stop offset="0%" stop-color="#ffffff"/>
+              <stop offset="35%" stop-color="#f3d9e8"/>
+              <stop offset="65%" stop-color="#cfe4f2"/>
+              <stop offset="100%" stop-color="#9aa6d6"/>
+            </radialGradient>
+          </defs>
+          <circle cx="20" cy="20" r="18" fill="url(#logoPearl)"/>
+        </svg>
+      </span>
+      Pearl
+    </a>
+    <nav class="main-nav" id="mainNav">
+      <a href="#protocol">Protocol</a>
+      <a href="#process">Pearlification</a>
+      <a href="#tokenomics">Tokenomics</a>
+      <a href="#tech">Tech</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="assets/pearl-whitepaper.pdf" class="nav-cta">Whitepaper</a>
+    </nav>
+    <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="hero-glow" aria-hidden="true"></div>
+    <div class="wrap hero-inner">
+      <p class="eyebrow">Proof&nbsp;of&nbsp;Useful&nbsp;Work &middot; L1 Protocol</p>
+      <h1>Everything valuable<br> starts as an <em>irritant</em>.</h1>
+      <p class="hero-sub">
+        An oyster wraps a grain of sand in layer after layer of nacre until it becomes a pearl.
+        Pearl wraps raw GPU computation — the matrix multiplications that power AI — in layers of
+        cryptographic noise, until it becomes a block. Same process. Different kind of treasure.
+      </p>
+      <div class="hero-actions">
+        <a href="#process" class="btn btn-primary">See How It's Pearlified</a>
+        <a href="assets/pearl-whitepaper.pdf" class="btn btn-ghost">Read the Whitepaper</a>
+      </div>
+      <div class="hero-stats">
+        <div><strong>194s</strong><span>block time</span></div>
+        <div><strong>2.1B</strong><span>PRL total supply</span></div>
+        <div><strong>1 grain</strong><span>smallest unit</span></div>
+      </div>
+    </div>
+    <div class="pearl-orbit" aria-hidden="true">
+      <div class="pearl-core"></div>
+      <div class="ring ring-1"></div>
+      <div class="ring ring-2"></div>
+      <div class="ring ring-3"></div>
+    </div>
+  </section>
+
+  <!-- WHAT IS PEARL -->
+  <section id="protocol" class="section">
+    <div class="wrap">
+      <p class="kicker">01 &mdash; The Protocol</p>
+      <h2>Bitcoin turned electricity into money.<br>Pearl turns compute into money.</h2>
+      <p class="lede">
+        Bitcoin's proof-of-work showed the world that scarce, verifiable energy could become
+        digital scarcity. But its hashing is artificial &mdash; work invented purely to be hard.
+        Pearl replaces that wasted hashing with the one operation every GPU on Earth already
+        exists to perform: <strong>matrix multiplication</strong>. Mining Pearl and running AI
+        training or inference become, as much as possible, the same act.
+      </p>
+
+      <div class="card-grid">
+        <div class="feature-card">
+          <div class="feature-icon">◈</div>
+          <h3>AI-Native Mining</h3>
+          <p>Block rewards are minted in direct proportion to verifiable MatMul operations &mdash;
+          the exact computation underlying every neural network on the planet.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">◇</div>
+          <h3>Dual-Utility Yield</h3>
+          <p>The same GPU cycle that trains or serves a model can simultaneously mine a block.
+          Security and useful work are no longer competing for energy &mdash; they share it.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">◆</div>
+          <h3>Economically ASIC-Resistant</h3>
+          <p>A chip built only to mine Pearl loses the ability to do useful AI work, and is
+          therefore strictly less profitable than a general-purpose accelerator.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">◉</div>
+          <h3>Zero-Knowledge Privacy</h3>
+          <p>Model weights and proprietary data never leave the miner. Proofs attest that the
+          work happened &mdash; without revealing what was computed.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- THE PEARLIFICATION PROCESS -->
+  <section id="process" class="section section-dark">
+    <div class="wrap">
+      <p class="kicker">02 &mdash; The Pearlification Process</p>
+      <h2>How a grain of compute becomes a Pearl</h2>
+      <p class="lede">
+        Every real pearl forms in four stages: irritant, nacre, patient grinding, and lustre.
+        The Pearl protocol mirrors this exactly &mdash; it's not just a metaphor, it's the
+        literal mechanism (Section&nbsp;3 of the whitepaper).
+      </p>
+
+      <ol class="process-list">
+        <li class="process-step">
+          <div class="process-num">01</div>
+          <div class="process-body">
+            <h3>The Grain</h3>
+            <p>
+              An oyster needs an irritant to begin. Pearl needs a workload: two real matrices,
+              <em>A</em> and <em>B</em>, drawn from an actual AI training or inference job.
+              This is the raw, unglamorous grain of sand the whole process is built around.
+            </p>
+          </div>
+        </li>
+        <li class="process-step">
+          <div class="process-num">02</div>
+          <div class="process-body">
+            <h3>The Nacre</h3>
+            <p>
+              The oyster secretes layer upon layer of nacre around the grain. Pearl deterministically
+              generates low-rank noise matrices <em>E</em> and <em>F</em>, seeded from a cryptographic
+              commitment to <em>A</em>, <em>B</em>, and the chain state, and adds them to the workload.
+              The result is uniformly hard to compute &mdash; indistinguishable from pure randomness &mdash;
+              so no miner can cheat by picking easy inputs.
+            </p>
+          </div>
+        </li>
+        <li class="process-step">
+          <div class="process-num">03</div>
+          <div class="process-body">
+            <h3>The Tumble</h3>
+            <p>
+              Layer formation takes time and repetition. Miners grind the noised matrices tile by
+              tile, accumulating a running hash of each block's intermediate values, searching for
+              the one tile whose BLAKE3 digest slips beneath the difficulty target &mdash; a winning
+              lottery ticket earned only through real, verifiable computation.
+            </p>
+          </div>
+        </li>
+        <li class="process-step">
+          <div class="process-num">04</div>
+          <div class="process-body">
+            <h3>The Lustre</h3>
+            <p>
+              A jeweler cracks nothing open &mdash; the pearl is simply drawn out, whole. Pearl peels
+              the noise back through a quick, exact correction, recovering the true product
+              <em>A&middot;B</em>, while a zk-SNARK (Plonky2, hash-based, post-quantum) proves the
+              entire process was done honestly &mdash; without ever revealing <em>A</em> or <em>B</em>
+              themselves. What's left is lustrous: a valid block, a minted reward, and a completed
+              unit of real AI work.
+            </p>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- VIRTUOUS LOOP -->
+  <section class="section">
+    <div class="wrap">
+      <p class="kicker">03 &mdash; The Loop</p>
+      <h2>A virtuous loop, not a zero-sum race</h2>
+      <p class="lede">
+        Classical proof-of-work monetizes security alone. Pearl monetizes security
+        <em>and</em> utility, so the payout for defending the network can subsidize genuinely
+        useful compute.
+      </p>
+      <div class="loop-grid">
+        <div class="loop-step">
+          <span class="loop-index">1</span>
+          <p>Market demand for AI increases the value of the mining subsidy.</p>
+        </div>
+        <div class="loop-step">
+          <span class="loop-index">2</span>
+          <p>Higher reward value incentivizes deploying more useful compute onto the network.</p>
+        </div>
+        <div class="loop-step">
+          <span class="loop-index">3</span>
+          <p>Greater compute power hardens the network's consensus and monetary credibility.</p>
+        </div>
+        <div class="loop-step">
+          <span class="loop-index">4</span>
+          <p>Mining produces real inference and training output that accrues real economic value.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TOKENOMICS -->
+  <section id="tokenomics" class="section section-dark">
+    <div class="wrap">
+      <p class="kicker">04 &mdash; Tokenomics</p>
+      <h2>Sized like a pearl, priced like a currency</h2>
+      <p class="lede">
+        Pearl forks Bitcoin's UTXO model and monetary discipline, then smooths out its rough edges.
+      </p>
+
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-value">2,100,000,000</div>
+          <div class="stat-label">Total PRL supply</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">1 grain</div>
+          <div class="stat-label">Smallest unit &mdash; 10<sup>&minus;8</sup> PRL</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">194s</div>
+          <div class="stat-label">Target block time (3:14)</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">1&frasl;t&sup2;</div>
+          <div class="stat-label">Emission decay &mdash; no halving cliffs</div>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div>
+          <h3>No halving shocks</h3>
+          <p>
+            Bitcoin's emission halves overnight every four years, creating incentive cliffs and
+            volatility. Pearl instead decays smoothly, polynomially, block by block &mdash; the
+            remaining supply falls like <code>1/t</code> rather than dropping in steps. Early
+            miners are rewarded, but the tail stays thick enough to keep funding long-run security.
+          </p>
+        </div>
+        <div>
+          <h3>WTEMA difficulty</h3>
+          <p>
+            Rather than Bitcoin's 2016-block retarget window, Pearl re-tunes difficulty every
+            block with a Weighted-Target Exponential Moving Average, keeping block time stable
+            without the whiplash of infrequent, large corrections.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TECH -->
+  <section id="tech" class="section">
+    <div class="wrap">
+      <p class="kicker">05 &mdash; Under the Nacre</p>
+      <h2>Technical specifications</h2>
+
+      <div class="tech-grid">
+        <div class="tech-item">
+          <h4>Hash-based zk-SNARKs</h4>
+          <p>Built on Plonky2 &mdash; no trusted setup, transparent, and secure against quantum
+          adversaries since it relies only on hash functions, not elliptic-curve assumptions.
+          Three-layer recursion compresses proofs to under 60KB.</p>
+        </div>
+        <div class="tech-item">
+          <h4>Post-quantum addresses</h4>
+          <p>Standardized on Taproot, with an XMSS hash-based signature path (<code>OP_CHECKXMSSSIG</code>)
+          and Pay-to-Merkle-Root outputs reserved for activation if Schnorr signatures are ever
+          weakened by quantum computers.</p>
+        </div>
+        <div class="tech-item">
+          <h4>Low-rank noise paradigm</h4>
+          <p>Noise matrices are constructed with rank <em>r</em>, so the correction terms cost only
+          <code>O(n&sup2;r)</code> operations &mdash; letting the true product be recovered almost
+          for free once the noised multiplication is done.</p>
+        </div>
+        <div class="tech-item">
+          <h4>Tile-level commitments</h4>
+          <p>Matrices are committed as BLAKE3 Merkle trees, row-major for <em>A</em>, column-major
+          for <em>B</em> &mdash; keeping opening proofs small and letting <em>B</em> (often known
+          in advance, as with model weights) be pre-noised once per chain-state update.</p>
+        </div>
+        <div class="tech-item">
+          <h4>Dynamic block certificates</h4>
+          <p>The 80-byte Bitcoin header's fixed nonce is replaced with a variable-length,
+          version-tagged block certificate, capped at 65KB, decoupling block identity from the
+          randomized zk-witness itself.</p>
+        </div>
+        <div class="tech-item">
+          <h4>OP_CAT re-enabled</h4>
+          <p>A resource-bounded concatenation opcode is restored to the script VM, widening the
+          space of programmable spending conditions available to Pearl contracts.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ROADMAP -->
+  <section id="roadmap" class="section section-dark">
+    <div class="wrap">
+      <p class="kicker">06 &mdash; What's Next</p>
+      <h2>From exact integers to the whole AI stack</h2>
+      <p class="lede">
+        Today's Pearl kernel is an exact INT MatMul &mdash; a drop-in for integer inference. Most
+        modern training and inference, however, runs in low-precision floating point (BF16, FP8,
+        FP4). A future PoUW upgrade is already in development to bring that world on-chain.
+      </p>
+      <div class="roadmap-grid">
+        <div class="roadmap-card">
+          <span class="roadmap-tag">Live</span>
+          <h4>Exact INT MatMul mining</h4>
+          <p>Drop-in proof-of-useful-work for integer inference workloads, in production today.</p>
+        </div>
+        <div class="roadmap-card">
+          <span class="roadmap-tag">In research</span>
+          <h4>Quantization-native PoUW</h4>
+          <p>A high-accuracy approximate MatMul that doubles as a plug-in quantization library,
+          using native quantization noise itself as the PoW perturbation.</p>
+        </div>
+        <div class="roadmap-card">
+          <span class="roadmap-tag">Planned</span>
+          <h4>Training workload onboarding</h4>
+          <p>Extending mining eligibility to BF16 training, not just inference.</p>
+        </div>
+        <div class="roadmap-card">
+          <span class="roadmap-tag">Vision</span>
+          <h4>A marketplace of useful compute</h4>
+          <p>Native on-chain settlement of compute contracts &mdash; unifying tokens mined across
+          different hardware and precisions into one, and tying Pearl's value directly to demand
+          for real-world AI compute.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="section cta-section">
+    <div class="wrap cta-inner">
+      <h2>Bring your GPU cycles to the reef.</h2>
+      <p>Every kilowatt-hour spent training or serving a model can now also secure a network
+      and earn a reward. Read the full protocol design, or dive into the source.</p>
+      <div class="hero-actions">
+        <a href="assets/pearl-whitepaper.pdf" class="btn btn-primary">Download the Whitepaper</a>
+        <a href="https://github.com/pearl-foundation/pearl" class="btn btn-ghost">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <div class="footer-brand">
+      <span class="logo-mark" aria-hidden="true">
+        <svg viewBox="0 0 40 40" width="22" height="22">
+          <circle cx="20" cy="20" r="18" fill="url(#logoPearl)"/>
+        </svg>
+      </span>
+      <span>Pearl Research Labs</span>
+    </div>
+    <nav class="footer-nav">
+      <a href="assets/pearl-whitepaper.pdf">Whitepaper</a>
+      <a href="https://github.com/pearl-foundation/pearl">GitHub</a>
+      <a href="#top">Back to top</a>
+    </nav>
+  </div>
+  <div class="wrap footer-disclaimer">
+    <p>Pearl is an experimental protocol. Portions of the design described here are unaudited
+    and subject to change prior to and after launch. Nothing on this site is financial advice.</p>
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
