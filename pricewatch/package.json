@@ -1,0 +1,16 @@
+{
+  "name": "pricewatch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Competitor price and stock monitoring for small online retailers",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --experimental-sqlite src/main.js",
+    "crawl": "node --experimental-sqlite src/cli-crawl.js",
+    "test": "node --experimental-sqlite --test test/"
+  },
+  "dependencies": {}
+}
