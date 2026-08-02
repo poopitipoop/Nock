@@ -488,6 +488,56 @@ RecommendedSeedLen constant."* The code is correct — 128 bits is standard
 
 ---
 
+### PKG-1 — `@pearl/pearl-address-validation` accepts Bitcoin base58 addresses as valid Pearl addresses  ·  **Medium** (latent — no in-repo consumer)
+
+**Location:** `apps/packages/pearl-address-validation/src/index.ts`
+
+The package validates bech32m/taproot addresses correctly: it requires a
+`prl1p` / `tprl1p` / `rprl1p` prefix, decodes with bech32m, enforces witness
+version 1, and requires a 32-byte witness program. That path is sound.
+
+The **base58 fallback path** is not. It accepts any base58check string whose
+version byte is in:
+
+```js
+const addressTypes = {
+  0x00: { type: p2pkh, network: mainnet },   // Bitcoin P2PKH
+  0x6f: { type: p2pkh, network: testnet },
+  0x05: { type: p2sh,  network: mainnet },   // Bitcoin P2SH
+  0xc4: { type: p2sh,  network: testnet },
+};
+```
+
+These are **Bitcoin's** version bytes. Pearl's `node/chaincfg/params.go`
+defines no `PubKeyHashAddrID` and no `ScriptHashAddrID` at all — the chain is
+taproot-only (`txauthor/author.go:110-116` accepts only P2TR and P2MR
+scripts). There is no such thing as a legacy base58 Pearl address.
+
+**Impact.** `validate("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")` returns `true`
+with `network: mainnet`. Any consumer using this library to gate a
+withdrawal or send flow would accept a Bitcoin address as a valid Pearl
+mainnet destination. Funds sent there would pay a script no Pearl key can
+redeem — permanent loss.
+
+**Why this is Medium, not High.** The package has **zero importers in the
+repository**, and Pearl Desktop Wallet does not use it — the desktop wallet
+validates via the daemon's `validateaddress` RPC
+(`preload/index.ts` → `wallet-validate-address`), which is the correct path.
+The hazard is latent: this is a versioned, published-style package
+(`@pearl/pearl-address-validation` v3.0.0, `main: dist/index.js`) evidently
+intended for external consumers such as exchanges or integrators.
+
+**Remediation.** Delete the base58 branch and the `addressTypes` table
+entirely; on a taproot-only chain any non-bech32m input should be rejected
+outright.
+
+**Minor, same file.** `mapPrefixToNetwork` maps `rprl → simnet`, but Pearl
+uses the `rprl` HRP for **both** regtest (`params.go:476`) and simnet
+(`params.go:754`), so the two are indistinguishable and regtest is
+mislabelled. Low impact — both are test networks.
+
+---
+
 ### ZKP-1 — `extract_difficulty_bound` fails open on overflow  ·  **Informational**
 
 **Location:** `zk-pow/src/api/sanity_checks.rs`, `extract_difficulty_bound`
@@ -552,11 +602,16 @@ available and used elsewhere in the tree.
 | OYS-8 | Oyster | Info | Dead `rand.Seed` |
 | OYS-9 | Oyster | Info | Stale seed-length comment |
 | OYS-10 | Oyster | Info | Secrets not zeroed in setup path |
+| PKG-1 | apps/packages | Medium\*\* | `pearl-address-validation` accepts Bitcoin base58 addresses as valid Pearl addresses |
 | ZKP-1 | zk-pow | Info | `extract_difficulty_bound` fails open on overflow (guarded upstream) |
 
 \* OYS-11 is conditional: it affects only users who explicitly opted into PQ
 addresses (`pq=true`), which is not the default and which the desktop wallet
 never requests.
+
+\*\* PKG-1 is latent: the package has no importer in this repository and the
+desktop wallet does not use it. It is rated Medium because it is a versioned,
+distributable library evidently intended for external integrators.
 
 **Revised bottom line.** Oyster's key generation, signing, authentication, and
 on-disk permissions are sound, and the SPV and consensus validation paths hold
@@ -616,6 +671,48 @@ pipeline or maintainer account. Consider cosign/sigstore or GPG signing, plus
 SLSA provenance.
 
 ---
+
+## 5b. Non-security observation — upstream copyright attribution
+
+Not a vulnerability, and not legal advice — flagged because it is likely
+unintentional and cheap to fix.
+
+`node/` and `wallet/` are derived from btcd, btcwallet, and neutrino, all
+ISC-licensed by Conformal Systems / the btcsuite developers. In the current
+tree:
+
+- 460 of 532 `.go` files under `node/` carry a `Pearl Research Labs`
+  copyright header;
+- **0** retain a btcsuite or Conformal notice;
+- the root `LICENSE` credits `Pearl Research Labs` and `The Decred
+  developers`, but not btcsuite.
+
+The ISC license requires that "the above copyright notice and this permission
+notice appear in all copies." The README does credit btcd/btcwallet/neutrino
+at a project level, so this reads as an oversight during relicensing rather
+than intent. Restoring the original notices alongside Pearl's — as was
+evidently done for Decred — would resolve it.
+
+## 5c. Consensus design observations (not findings)
+
+Noted so a future reviewer does not re-derive them:
+
+- **The script-flag system is vestigial.** `StandardVerifyFlags ScriptFlags = 0`
+  (`txscript/standard.go:26`) and none of btcd's ~21 `ScriptVerify*` flags
+  survive. Behaviour is hardcoded for a taproot-only chain. The checks those
+  flags gated are still enforced unconditionally — `ErrCleanStack`,
+  `ErrNullFail`, `ErrMinimalIf`, `ErrMinimalData`,
+  `ErrDiscourageUpgradeableTaprootVersion`, and witness-program length
+  (`engine.go:430,440`) all remain live. This is a simplification, not a
+  weakening.
+- **`OP_SUCCESS` is not implemented** — no active handling, only comments.
+  This forecloses Bitcoin's taproot soft-fork upgrade mechanism. A design
+  choice, not a defect.
+- **`pearl-blake3`** wraps the audited `blake3` crate v1.8 but builds its
+  Merkle tree via the crate's `hazmat` API (`merge_subtrees_root`,
+  `merge_subtrees_non_root`) with hand-defined domain-separation flags. The
+  primitive is sound; the custom tree construction is the part that warrants
+  dedicated test vectors.
 
 ## 6. Unrelated ecosystem hazard (not a code defect)
 
