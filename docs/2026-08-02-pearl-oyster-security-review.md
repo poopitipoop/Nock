@@ -89,6 +89,9 @@ non-cryptographic source.
 | BIP324 v2 transport | Faithful port — nonce is `msgctr(4) ‖ rekeyctr(8)`, rekey nonce prefixed `0xffffffff`, `MaxGarbageLen = 4095` per spec (`v2transport/chacha.go`, `transport.go:40`) |
 | Miner RPC exposure | UDS default at `0600`; TCP mode binds hard-coded `127.0.0.1` regardless of configured `host` (`miner_rpc/server.py:106`) |
 | Repo-wide secret sweep | No hardcoded keys, tokens, or passwords matching high-entropy patterns across Go/Rust/TS/Python |
+| Mempool policy | Full DoS limit set intact — `MaxOrphanTxs`, `MaxOrphanTxSize`, `MinRelayTxFee`, `MaxMempoolSize`, orphan expiry scan |
+| Eclipse resistance (addrmgr) | Netgroup bucketing intact (1024 new / 64 tried, 64 per group); bucket key seeded from `crypto/rand` (`addrmanager.go:713`) |
+| Rust `unsafe` footprint | `pearl-blake3` 0, `miner/` 0; zk-pow 20 (18 in FFI/bindings, 2 flagged as RS-1); plonky2 161, inherited from upstream |
 | p2p message limits | Standard btcd bounds intact — `MaxMessagePayload` 32 MB, `MaxInvPerMsg` 50 000, `MaxAddrPerMsg` 1 000, `MaxBlockPayload` 4 MB |
 
 ---
@@ -615,6 +618,116 @@ mislabelled. Low impact — both are test networks.
 
 ---
 
+### ZKP-2 — plonky2 fork modifies soundness-critical code that the bundled audits do not cover  ·  **Informational** (assurance gap, not a defect)
+
+**Location:** `plonky2/` (Pearl fork), `plonky2/audits/`
+
+`plonky2/README.md` states this is the Pearl fork of Polygon Zero's plonky2,
+maintained by the Pearl team after upstream deprecated it in favour of
+Plonky3. Upstream attribution is properly retained here.
+
+`plonky2/audits/` contains two Least Authority reports — "Polygon Zero
+Plonky2" and "Polygon Zero Starky & zkEVM Kernel". **Both audit upstream's
+unmodified library.** Neither covers Pearl's fork, and neither covers Pearl's
+own circuits in `zk-pow/src/circuit/`.
+
+Diffing the fork against upstream `0xPolygonZero/plonky2` HEAD shows
+modification concentrated in exactly the soundness-critical files:
+
+| File | Changed lines |
+|---|---|
+| `plonky2/src/fri/verifier.rs` | 73 |
+| `plonky2/src/plonk/verifier.rs` | 38 |
+| `plonky2/src/plonk/get_challenges.rs` | 36 |
+| `starky/src/get_challenges.rs` | 28 |
+| `starky/src/config.rs` | 23 |
+| `plonky2/src/fri/validate_shape.rs` | 12 |
+| `plonky2/src/plonk/validate_shape.rs` | 6 |
+
+plus a new `starky/src/pair_stark` module. (Some fraction is upstream drift
+since the fork point rather than Pearl's work; upstream is deprecated, so
+drift should be limited, but the split was not separated.)
+
+The most consequential change is a new `oracles_to_skip` parameter on the FRI
+verifier:
+
+```rust
+/// Verifies a FRI proof, skipping Merkle proof verification for oracle indices in
+/// `oracles_to_skip`. Use when the verifier has computed those oracle evaluations itself.
+/// Pass `&[]` to skip nothing.
+```
+
+Skipping Merkle verification for an oracle is sound **only if** the verifier
+genuinely recomputes those evaluations and binds them to the transcript. That
+is the evident intent — it pairs with the new `preprocessed_columns` concept,
+which the verifier computes itself (`zk-pow/src/api/verify.rs` supplies
+`preprocessed_columns` as a public input). But an incorrect `oracles_to_skip`
+at any call site would let a prover supply arbitrary values for a skipped
+oracle, which is a total soundness break.
+
+**This is not a reported vulnerability.** No misuse was found, and the spot
+checks performed were positive — see below. It is recorded as an **assurance
+gap**: the audited artifact and the shipped artifact are not the same code,
+and the delta lands precisely in the verifier.
+
+**Positive signal.** The `starky/src/config.rs` change observes the new
+`preprocessed_columns` into the Fiat-Shamir challenger with a length prefix
+for state separation, and mirrors it correctly in *both* the native and
+in-circuit recursive verifiers:
+
+```rust
+// Include length as first element for state separation
+let mut prep_cols = vec![F::from_canonical_usize(self.preprocessed_columns.len())];
+prep_cols.extend(self.preprocessed_columns.iter().map(|&i| F::from_canonical_usize(i)));
+challenger.observe_elements(&prep_cols);
+```
+
+Binding new public parameters into the transcript, length-prefixed, in both
+verifier forms is what a soundness-aware author does. This raises confidence
+in the fork's quality without substituting for an audit.
+
+**Recommendation.** Commission a cryptographic audit scoped to the fork delta
+and to `zk-pow/src/circuit/`, and state plainly in `plonky2/README.md` that
+the bundled audits apply to upstream and not to this fork.
+
+---
+
+### RS-1 — Unsound `unsafe` aliasing in BLAKE3 trace generation  ·  **Low** (prover-side only)
+
+**Location:** `zk-pow/src/circuit/chip/blake3/trace.rs:111` and the identical
+`zk-pow/src/v1/circuit/chip/blake3/trace.rs:113`
+
+```rust
+blocks.par_iter().for_each(|&(first, pivot, params)| {
+    ...
+    for row_idx in first..=pivot {
+        let row = unsafe { &mut *(trace.as_ptr() as *mut [F; pearl_columns::TOTAL]).add(row_idx) };
+```
+
+Inside a rayon parallel iterator, `trace.as_ptr()` (a `*const` derived from a
+shared reference) is cast to `*mut` and dereferenced as `&mut`. Writing
+through a pointer derived from a shared reference violates Rust's aliasing
+model, and shared reads of the same buffer (`&trace[row_idx]`) occur
+concurrently with those writes. There is no `// SAFETY:` comment.
+
+**In practice** the row ranges appear disjoint per block, so there is likely
+no data race today. But this is undefined behaviour by the language rules —
+Miri would reject it — and a future compiler is entitled to miscompile it.
+
+**Severity is Low and bounded:** this is **trace generation in the prover**,
+not the verifier. Miscompilation would yield invalid proofs (a miner wasting
+work), not acceptance of invalid proofs. It is not a consensus-security
+issue.
+
+**Remediation.** Use `par_chunks_mut` over disjoint row ranges, or wrap the
+buffer in a `SyncUnsafeCell`-style type with an explicit `// SAFETY:` comment
+justifying disjointness. Note there are **two copies** of this code (`v1/` and
+current); fix both.
+
+`pearl-blake3` and `miner/` contain **zero** `unsafe` blocks.
+
+---
+
 ### ZKP-1 — `extract_difficulty_bound` fails open on overflow  ·  **Informational**
 
 **Location:** `zk-pow/src/api/sanity_checks.rs`, `extract_difficulty_bound`
@@ -683,6 +796,8 @@ available and used elsewhere in the tree.
 | GW-2 | miner/gateway | Low | Weak default RPC credentials (`user`/`pass`) |
 | GW-3 | miner/gateway | Info | UDS created in world-writable `/tmp` before chmod 0600 |
 | PKG-1 | apps/packages | Medium\*\* | `pearl-address-validation` accepts Bitcoin base58 addresses as valid Pearl addresses |
+| RS-1 | zk-pow | Low | Unsound `unsafe` aliasing in BLAKE3 trace gen (prover-side only; two copies) |
+| ZKP-2 | plonky2 | Info | Fork modifies soundness-critical verifier code; bundled audits cover upstream only |
 | ZKP-1 | zk-pow | Info | `extract_difficulty_bound` fails open on overflow (guarded upstream) |
 
 \* OYS-11 is conditional: it affects only users who explicitly opted into PQ
