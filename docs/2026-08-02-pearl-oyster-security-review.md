@@ -86,6 +86,9 @@ non-cryptographic source.
 | `wtxmgr` reorg handling | Standard upstream rollback with coinbase-credit tracking and recursive `removeConflict` / `removeDoubleSpends` |
 | ZK-PoW parameter soundness | FRI `(rate_bits, pow_bits)` are proof-supplied **but allowlisted** to 4 exact tuples (`pearl_circuit.rs:129-133`); query count is not proof-controlled; `stark_degree_bits ≤ 19` and `degree+rate ≤ 20` enforced |
 | ZK-PoW difficulty binding | `hash_jackpot` is a circuit public input and is checked against the header's `nbits` (`sanity_checks.rs`), so PoW difficulty is bound to the proof |
+| BIP324 v2 transport | Faithful port — nonce is `msgctr(4) ‖ rekeyctr(8)`, rekey nonce prefixed `0xffffffff`, `MaxGarbageLen = 4095` per spec (`v2transport/chacha.go`, `transport.go:40`) |
+| Miner RPC exposure | UDS default at `0600`; TCP mode binds hard-coded `127.0.0.1` regardless of configured `host` (`miner_rpc/server.py:106`) |
+| Repo-wide secret sweep | No hardcoded keys, tokens, or passwords matching high-entropy patterns across Go/Rust/TS/Python |
 | p2p message limits | Standard btcd bounds intact — `MaxMessagePayload` 32 MB, `MaxInvPerMsg` 50 000, `MaxAddrPerMsg` 1 000, `MaxBlockPayload` 4 MB |
 
 ---
@@ -488,6 +491,80 @@ RecommendedSeedLen constant."* The code is correct — 128 bits is standard
 
 ---
 
+### GW-1 — Pearl node RPC password written to logs at INFO level  ·  **Medium**
+
+**Location:** `miner/pearl-gateway/src/pearl_gateway/pearl_client.py:29-31`
+
+```python
+logger.info(
+    f"PearlNodeClient initialized with rpc_url: {self.rpc_url}, "
+    f"rpc_user: {config.rpc_user}, rpc_password: {config.rpc_password}"
+)
+```
+
+The pearld RPC password is interpolated into an `INFO`-level log line, so it
+is emitted under default logging configuration — not only in debug mode.
+
+**Impact.** Under systemd/journald, Docker, Kubernetes, or any log shipper,
+the credential controlling the Pearl node's RPC interface is written to
+durable, often centrally-aggregated storage. Anyone with log read access
+gains node RPC control. On a mining host whose node also holds a wallet, that
+is a direct path to funds.
+
+Same class as OYS-2, different component and different credential.
+
+**Remediation.** Remove the credential from the log line; log the username and
+URL only, or redact.
+
+---
+
+### GW-2 — Weak default RPC credentials in gateway config  ·  **Low**
+
+**Location:** `miner/pearl-gateway/src/pearl_gateway/config.py:20-22`
+
+```python
+rpc_url: str = "http://0.0.0.0:44107"
+rpc_user: str = "user"
+rpc_password: str = "pass"
+```
+
+These are client-side defaults, so they are only usable if the operator
+configured pearld with matching credentials — but shipping `user`/`pass` as
+the default actively encourages exactly that. `0.0.0.0` is also incorrect as a
+*destination* address (it is a bind address; it happens to resolve to loopback
+on Linux) and should be `127.0.0.1`.
+
+**Remediation.** Leave the credentials unset and fail fast with a clear error
+when they are missing, as is already done for `mining_address` (which has no
+default). Change the URL default to `http://127.0.0.1:44107`.
+
+---
+
+### GW-3 — Unix socket created in world-writable `/tmp` before permissions are set  ·  **Informational**
+
+**Location:** `miner/pearl-gateway/src/pearl_gateway/miner_rpc/server.py:88-99`,
+default `socket_path = "/tmp/pearlgw.sock"`
+
+```python
+if os.path.exists(self.config.socket_path):
+    os.unlink(self.config.socket_path)
+self.server = await asyncio.start_unix_server(...)
+os.chmod(self.config.socket_path, 0o600)
+```
+
+The socket is created with the process umask and only then narrowed to `0600`,
+leaving a brief window in which another local user may connect. The
+`exists → unlink → create` sequence is itself a race in a world-writable
+directory.
+
+The final state is correct (`0600`), and TCP mode binds hard-coded to
+`127.0.0.1` regardless of the configured `host`, so exposure is minimal.
+
+**Remediation.** Create the socket inside a `0700` directory owned by the
+service (e.g. under `$XDG_RUNTIME_DIR`), or set the umask before binding.
+
+---
+
 ### PKG-1 — `@pearl/pearl-address-validation` accepts Bitcoin base58 addresses as valid Pearl addresses  ·  **Medium** (latent — no in-repo consumer)
 
 **Location:** `apps/packages/pearl-address-validation/src/index.ts`
@@ -602,6 +679,9 @@ available and used elsewhere in the tree.
 | OYS-8 | Oyster | Info | Dead `rand.Seed` |
 | OYS-9 | Oyster | Info | Stale seed-length comment |
 | OYS-10 | Oyster | Info | Secrets not zeroed in setup path |
+| GW-1 | miner/gateway | Medium | Pearl node RPC password logged at INFO level |
+| GW-2 | miner/gateway | Low | Weak default RPC credentials (`user`/`pass`) |
+| GW-3 | miner/gateway | Info | UDS created in world-writable `/tmp` before chmod 0600 |
 | PKG-1 | apps/packages | Medium\*\* | `pearl-address-validation` accepts Bitcoin base58 addresses as valid Pearl addresses |
 | ZKP-1 | zk-pow | Info | `extract_difficulty_bound` fails open on overflow (guarded upstream) |
 
