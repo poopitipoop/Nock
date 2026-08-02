@@ -74,6 +74,13 @@ non-cryptographic source.
 | Release pipeline | `workflow_dispatch` only; all third-party actions SHA-pinned; `persist-credentials: false`; `environment: release`; `draft: true`; binaries **promoted** from the tested build, not rebuilt |
 | `pull_request_target` usage | Safe — `types: [labeled]` + `safe-to-test` gate, and `remove_safe_label.yml` strips the label on every `synchronize`, closing the label-then-push TOCTOU |
 | Auto-updater | Notification-only — queries the releases API, compares semver, opens the release page. Never downloads or executes code (`"publish": null`) |
+| Fee/change arithmetic | Correct — `insufficientFunds` and `remainingAmount < maxRequiredFee` checks dominate, so `changeAmount` cannot underflow (`txauthor/author.go:100-136`) |
+| Change position randomization | `cprng` (crypto-seeded); `ChangeIndex >= 0` guarded at the call site (`createtx.go:279`) |
+| SPV block delivery | Sound — block hash checked against the validated header chain, plus `CheckBlockSanity` and `ValidateWitnessCommitment`, with peer banning (`spv/query.go:857-900`) |
+| SPV filter withholding | Cross-peer filter validation intact (`detectBadPeers`, `resolveFilterMismatchFromBlock`) |
+| SPV header validation | PoW enforced; `BFNoPoWCheck` set only for SimNet (`spv/blockmanager.go:2849`) |
+| ZK-PoW / XMSS build stubs | **Fail closed** — `zkpow` stub returns an error, `xmss.Verify` returns `false`. CI builds via `task build:blockchain` → `-tags xmss,zkpow` |
+| Certificate verification | Error propagated as `ruleError(ErrHighHash, …)`, not logged and swallowed (`blockchain/validate.go:333`) |
 
 ---
 
@@ -282,6 +289,110 @@ address without authentication configured.
 
 ---
 
+### OYS-11 — Recovery lookahead uses a different address-derivation convention than PQ address creation  ·  **High** (conditional: opt-in PQ addresses only)
+
+**Location:**
+`wallet/wallet/wallet.go:960,990` (`expandScopeHorizons`) vs
+`wallet/wallet/recovery.go:87,107`, with the gate at
+`wallet/waddrmgr/scoped_manager.go:547`
+
+A BIP-86 taproot output key is `internalKey + H_TapTweak(internalKey ‖ merkleRoot)·G`.
+Supplying a tapscript merkle root therefore yields a **different address** than
+the key-only tweak — this is BIP-341 arithmetic, not an implementation
+question. `newManagedAddress` reflects exactly this
+(`waddrmgr/address.go:521-523`):
+
+```go
+if tapscriptRoot != nil && len(tapscriptRoot) == 32 {
+    tapKey = txscript.ComputeTaprootOutputKey(pubKey, tapscriptRoot)
+}
+```
+
+Three independent inputs decide whether the XMSS tapscript root is applied,
+and they disagree:
+
+1. **Per-address opt-in at creation.** `usePQ := cmd.PQ != nil && *cmd.PQ`
+   (`legacyrpc/methods.go:606,635`) — defaults to **false**.
+2. **The recovery flag.** `expandScopeHorizons` — the lookahead window that
+   discovers funds at indexes the wallet does not yet know — passes
+   `includePQTapscript=false`. `recovery.go`, which re-derives only *already
+   known* indexes, passes `true`.
+3. **Lock/watch-only state.** `maybeDeriveTapscriptRoot` additionally requires
+   `key.IsPrivate()`, and `nextAddresses` selects `acctKeyPub` whenever the
+   manager is locked or watch-only (`scoped_manager.go:1239-1243`).
+
+The tapscript root *is* persisted per address
+(`waddrmgr/db.go:1408-1420`, encrypted), so a wallet with an intact database
+spends correctly. That persistence is precisely what is missing during a
+**seed-only restore**.
+
+**Impact.** On a fresh restore the wallet database is empty, so
+`ExternalKeyCount` is 0 and the `recovery.go` loops are no-ops — *every*
+address is derived through `expandScopeHorizons`, which uses the **non-PQ**
+convention. A user who opted into PQ addresses and later restores from the
+mnemonic alone will have the rescan search for the wrong scripts, and **funds
+received at those addresses are not discovered**.
+
+The funds are not cryptographically lost — the seed still controls them — but
+the shipped recovery path will not find them, which for most users is
+indistinguishable from loss.
+
+**Scope limiter.** PQ addresses are opt-in and default to false, and the
+desktop wallet never sets the flag (`preload/index.ts` invokes
+`wallet-get-new-address` with no PQ argument). Users who never passed
+`pq=true` are unaffected, and for them recovery is self-consistent.
+
+**Caveat.** This is control-flow analysis, not a dynamic reproduction —
+building the tree requires the cgo XMSS and Rust ZK-PoW static libraries.
+The BIP-341 arithmetic is certain; maintainers should confirm the code path
+empirically with a round-trip test.
+
+**Remediation.**
+- Record the derivation convention per account (or per address index) in a
+  form that survives into recovery — e.g. a scope-level flag persisted in the
+  account record and re-read before the lookahead runs.
+- Failing that, have `expandScopeHorizons` derive **both** variants into the
+  recovery window; the cost is a doubled window, and the alternative is
+  undiscoverable funds.
+- Add a round-trip regression test: create a PQ address, discard the database,
+  recover from seed, assert the address is rediscovered.
+
+---
+
+### OYS-12 — XMSS tapscript commitment silently omitted when the wallet is locked or watch-only  ·  **Medium**
+
+**Location:** `wallet/waddrmgr/scoped_manager.go:540-551`
+
+```go
+// 3. The key is private (not watch-only/imported account)
+// Returns nil (no tapscript root) if any condition is not met.
+if s.scope == KeyScopeBIP0086 && includePQTapscript && key.IsPrivate() {
+	return s.deriveTapscriptRoot(ns, path)
+}
+return nil, nil
+```
+
+`nextAddresses` selects the **public** account key whenever the manager is
+locked or the account is watch-only (`scoped_manager.go:1239-1243`), so
+`key.IsPrivate()` is false in those states.
+
+**Impact.** A caller that explicitly requests a post-quantum address
+(`getnewaddress … pq=true`) while the wallet is locked or watch-only receives
+an ordinary BIP-86 address instead. No error is returned and no warning is
+logged — the request silently degrades. The user believes the address carries
+the XMSS fallback commitment; it does not.
+
+This also means a watch-only companion wallet derives a different address set
+than the spending wallet for the same account, so it will not observe funds
+sent to PQ addresses.
+
+**Remediation.** Return an explicit error when `includePQTapscript` is
+requested but cannot be honoured, rather than silently returning `nil`. Fail
+closed: a user asking for post-quantum protection should never receive a
+non-PQ address without being told.
+
+---
+
 ### OYS-4 — Weak scrypt parameters for wallet encryption  ·  **Low**
 
 **Location:** `wallet/snacl/snacl.go:38-40` — `N=16384 (2^14)`, `r=8`, `p=1`
@@ -390,6 +501,8 @@ available and used elsewhere in the tree.
 | PDW-2 | Desktop | Medium | RPC credentials on argv |
 | PDW-3 | Desktop | Medium | Unsigned / un-notarized releases |
 | PDW-4 | Desktop | Low | Electron `sandbox: false`, unvalidated `openExternal` |
+| OYS-11 | Oyster | **High**\* | Recovery lookahead derivation convention mismatches PQ address creation — funds not rediscovered on seed-only restore |
+| OYS-12 | Oyster | Medium | XMSS commitment silently omitted when wallet locked/watch-only |
 | OYS-1 | Oyster | Medium | `--createfromfile` does not check file permissions |
 | OYS-2 | Oyster | Medium | Seed printed to stdout → captured by system logs |
 | OYS-3 | Oyster | Medium | Experimental gRPC server unauthenticated |
@@ -401,10 +514,17 @@ available and used elsewhere in the tree.
 | OYS-9 | Oyster | Info | Stale seed-length comment |
 | OYS-10 | Oyster | Info | Secrets not zeroed in setup path |
 
-**The Oyster daemon has no finding that directly causes loss of funds.** Its
-key generation, signing, authentication, and on-disk permissions are sound.
-The one High-severity issue is confined to the Electron desktop wallet, on the
-wallet-import path.
+\* OYS-11 is conditional: it affects only users who explicitly opted into PQ
+addresses (`pq=true`), which is not the default and which the desktop wallet
+never requests.
+
+**Revised bottom line.** Oyster's key generation, signing, authentication, and
+on-disk permissions are sound, and the SPV and consensus validation paths hold
+up. However OYS-11 means the daemon *can* fail to rediscover funds on a
+seed-only restore for users of the opt-in post-quantum address type — so the
+earlier statement that Oyster carried no fund-loss finding no longer holds
+without that qualification. PDW-1 remains the only issue that discloses key
+material outright.
 
 ---
 
@@ -412,10 +532,17 @@ wallet-import path.
 
 Reviewed: `wallet/` (Oyster), `apps/apps/pearl-desktop-wallet`,
 `node/btcutil/hdkeychain`, `node/btcec`, `node/txscript` (XMSS opcode),
-`wallet/snacl`, `wallet/waddrmgr`, `xmss/`, `.github/workflows/`, `install.sh`.
+`wallet/snacl`, `wallet/waddrmgr` (address & tapscript derivation),
+`wallet/wallet/txauthor` (fee/change arithmetic), `spv/` (header, block, and
+filter validation), `node/blockchain/validate.go` (certificate verification),
+`node/zkpow` + `xmss/` build-tag stubs, `xmss/`, `.github/workflows/`,
+`install.sh`.
 
-**Not** reviewed: consensus rules, `zk-pow/`, `plonky2/`, `miner/`, `spv/`
-internals, `dnsseeder/`, the PearlBridge browser wallet (separate repository).
+**Not** reviewed: the ZK-PoW Rust implementation itself (`zk-pow/src`,
+`plonky2/` — circuit soundness was not assessed), difficulty-retarget and
+median-time-past rules, `miner/`, `wtxmgr` accounting, p2p message parsing
+and DoS limits, `dnsseeder/`, the PearlBridge browser wallet (separate
+repository).
 
 Not performed:
 - **Dependency CVE scan.** `govulncheck` was rebuilt against Go 1.26.5 but the
