@@ -81,6 +81,12 @@ non-cryptographic source.
 | SPV header validation | PoW enforced; `BFNoPoWCheck` set only for SimNet (`spv/blockmanager.go:2849`) |
 | ZK-PoW / XMSS build stubs | **Fail closed** — `zkpow` stub returns an error, `xmss.Verify` returns `false`. CI builds via `task build:blockchain` → `-tags xmss,zkpow` |
 | Certificate verification | Error propagated as `ruleError(ErrHighHash, …)`, not logged and swallowed (`blockchain/validate.go:333`) |
+| Difficulty retarget (WTEMA) | Sound — mainnet `T=194s`, half-life 1 week (filter constant ≈ 0.00032), `MaxTimeOffsetMinutes=5` (Bitcoin uses 120). Max single-block timestamp manipulation moves the target ≈0.05%; target clamped to `[1, PowLimit]`; `ReduceMinDifficulty` panics if ever set on mainnet |
+| Timestamp rules | **Stricter than Bitcoin** — median-time-past is replaced by strict monotonicity (`MinTimestampDeltaSeconds = 1`, `validate.go:669-675`), guaranteeing `t ≥ 1` for the WTEMA; future drift capped at `now + 5min` |
+| `wtxmgr` reorg handling | Standard upstream rollback with coinbase-credit tracking and recursive `removeConflict` / `removeDoubleSpends` |
+| ZK-PoW parameter soundness | FRI `(rate_bits, pow_bits)` are proof-supplied **but allowlisted** to 4 exact tuples (`pearl_circuit.rs:129-133`); query count is not proof-controlled; `stark_degree_bits ≤ 19` and `degree+rate ≤ 20` enforced |
+| ZK-PoW difficulty binding | `hash_jackpot` is a circuit public input and is checked against the header's `nbits` (`sanity_checks.rs`), so PoW difficulty is bound to the proof |
+| p2p message limits | Standard btcd bounds intact — `MaxMessagePayload` 32 MB, `MaxInvPerMsg` 50 000, `MaxAddrPerMsg` 1 000, `MaxBlockPayload` 4 MB |
 
 ---
 
@@ -482,6 +488,39 @@ RecommendedSeedLen constant."* The code is correct — 128 bits is standard
 
 ---
 
+### ZKP-1 — `extract_difficulty_bound` fails open on overflow  ·  **Informational**
+
+**Location:** `zk-pow/src/api/sanity_checks.rs`, `extract_difficulty_bound`
+
+```rust
+if target_difficulty > U256::MAX / difficulty_adjustment_factor {
+    info!("Difficulty is too easy: hardness={} h*w*k={}", ...);
+    U256::MAX          // every hash satisfies the bound
+} else {
+    target_difficulty * difficulty_adjustment_factor
+}
+```
+
+When the difficulty-adjustment factor would overflow, the function returns
+`U256::MAX`, so `check_jackpot_against_nbits` accepts **any** jackpot hash.
+The condition is logged at `info` level, not treated as an error.
+
+**Not currently exploitable.** `checkProofOfWork` rejects
+`target.Sign() <= 0` and `target > powLimit` (`blockchain/validate.go:311-323`)
+*before* `VerifyCertificate` is reached, so `nbits` on mainnet cannot reach the
+overflow range.
+
+The concern is stylistic but consensus-adjacent: a fail-open default inside a
+proof-of-work check depends on an invariant enforced in a different language,
+in a different module, by a different call. If that ordering is ever changed
+or a new caller invokes verification directly, the branch silently accepts
+invalid work.
+
+**Remediation.** Return an error rather than `U256::MAX`, and log at `warn`
+or `error`.
+
+---
+
 ### OYS-10 — Seed and passphrase not zeroed in the setup path  ·  **Informational**
 
 **Location:** `wallet/walletsetup.go:157-193`
@@ -513,6 +552,7 @@ available and used elsewhere in the tree.
 | OYS-8 | Oyster | Info | Dead `rand.Seed` |
 | OYS-9 | Oyster | Info | Stale seed-length comment |
 | OYS-10 | Oyster | Info | Secrets not zeroed in setup path |
+| ZKP-1 | zk-pow | Info | `extract_difficulty_bound` fails open on overflow (guarded upstream) |
 
 \* OYS-11 is conditional: it affects only users who explicitly opted into PQ
 addresses (`pq=true`), which is not the default and which the desktop wallet
@@ -538,11 +578,23 @@ filter validation), `node/blockchain/validate.go` (certificate verification),
 `node/zkpow` + `xmss/` build-tag stubs, `xmss/`, `.github/workflows/`,
 `install.sh`.
 
-**Not** reviewed: the ZK-PoW Rust implementation itself (`zk-pow/src`,
-`plonky2/` — circuit soundness was not assessed), difficulty-retarget and
-median-time-past rules, `miner/`, `wtxmgr` accounting, p2p message parsing
-and DoS limits, `dnsseeder/`, the PearlBridge browser wallet (separate
-repository).
+Also reviewed in a later pass: difficulty retarget and timestamp rules
+(`node/blockchain/difficulty.go`, `validate.go`), `wtxmgr` reorg and
+double-spend handling, `node/wire` message bounds, and the ZK-PoW
+**verifier API** — parameter validation (`zk-pow/src/circuit/pearl_circuit.rs`)
+and difficulty binding (`zk-pow/src/api/verify.rs`, `sanity_checks.rs`).
+
+**Not** reviewed: **ZK circuit soundness** — whether the AIR constraints in
+`zk-pow/src/circuit/` actually enforce the claimed matrix-multiplication
+computation, and the `plonky2/` fork itself. This is the single largest
+remaining unknown and is **not assessable by source reading**; it requires a
+specialist cryptographic audit with formal analysis of the constraint system.
+A flaw there would let an attacker forge proofs of work, which is a
+chain-integrity failure rather than a wallet failure, but it would make
+confirmations meaningless.
+
+Also not reviewed: `miner/`, `dnsseeder/`, `spv/` internals beyond validation,
+and the PearlBridge browser wallet (separate repository).
 
 Not performed:
 - **Dependency CVE scan.** `govulncheck` was rebuilt against Go 1.26.5 but the
