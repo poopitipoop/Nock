@@ -618,6 +618,54 @@ mislabelled. Low impact — both are test networks.
 
 ---
 
+### DEP-1 — `google.golang.org/grpc v1.82.0` is affected by GHSA-hrxh-6v49-42gf  ·  **Low** for default deployments (High CVSS, but the affected server is opt-in)
+
+**Location:** `go.mod` — `google.golang.org/grpc v1.82.0`
+
+[GHSA-hrxh-6v49-42gf](https://github.com/advisories/GHSA-hrxh-6v49-42gf)
+(CVSS 8.8, High) affects all `google.golang.org/grpc` versions **< 1.82.1**.
+Pearl pins v1.82.0, one patch release behind the fix. It bundles three
+server-role issues:
+
+| Sub-issue | Applies to Pearl? |
+|---|---|
+| xDS RBAC authorization bypass (`Metadata` / `RequestedServerName` matchers silently ignored) | **No** — Pearl does not use xDS |
+| **HTTP/2 Rapid Reset DoS** — rapid stream create/terminate bypasses reader blocking, high CPU | **Yes**, for any gRPC server |
+| xDS RBAC engine panic on `NOT`-wrapped unsupported field | **No** — no xDS |
+
+**Impact.** Only the Rapid Reset DoS is reachable. Oyster's gRPC surface is
+the experimental `WalletLoaderService`, which is **not started by default**
+(`ExperimentalRPCListeners` is empty unless configured — see OYS-3). An
+operator who enables it exposes a remote CPU-exhaustion vector. No key
+material is at risk.
+
+**Remediation.** `go get google.golang.org/grpc@v1.82.1`.
+
+**Checked and NOT affected:**
+
+| Dependency | Pinned | Advisory status |
+|---|---|---|
+| `golang.org/x/crypto` | v0.53.0 | The GO-2026-5005/5006/5013/5017/5018/5019/5020/5021/5023/5033 cluster was fixed in **v0.52.0** — ahead of it |
+| `golang.org/x/net` | v0.56.0 | GO-2026-5026 fixed in **v0.55.0**; CVE-2026-33814 fixed earlier — ahead of both |
+| `go.etcd.io/bbolt` | v1.5.0 | Current release; no advisory found |
+| `google.golang.org/grpc` | v1.82.0 | CVE-2026-33186 (CVSS 9.1 authz bypass) fixed in 1.79.3 — **not** affected by that one |
+
+**Method caveat — this is not a substitute for `govulncheck`.** The review
+environment's egress policy blocks `vuln.go.dev` and `api.osv.dev` (403 on
+CONNECT), so this is *version matching against published advisories*, not
+`govulncheck`'s call-graph reachability analysis. It can miss advisories it
+did not search for, and it cannot tell whether a vulnerable code path is
+actually reachable from Pearl's code. Maintainers should still run
+`govulncheck ./...` in CI.
+
+**Ancillary observation.** Two transitive btcsuite dependencies are pinned to
+pseudo-versions roughly a decade old — `github.com/btcsuite/websocket`
+(2015-01-19) and `github.com/btcsuite/go-socks` (2017-01-05). Both are
+inherited from btcd upstream and neither has a published advisory, but both
+are effectively unmaintained forks and worth tracking.
+
+---
+
 ### ZKP-2 — plonky2 fork modifies soundness-critical code that the bundled audits do not cover  ·  **Informational** (assurance gap, not a defect)
 
 **Location:** `plonky2/` (Pearl fork), `plonky2/audits/`
@@ -796,6 +844,7 @@ available and used elsewhere in the tree.
 | GW-2 | miner/gateway | Low | Weak default RPC credentials (`user`/`pass`) |
 | GW-3 | miner/gateway | Info | UDS created in world-writable `/tmp` before chmod 0600 |
 | PKG-1 | apps/packages | Medium\*\* | `pearl-address-validation` accepts Bitcoin base58 addresses as valid Pearl addresses |
+| DEP-1 | go.mod | Low\*\*\* | `grpc v1.82.0` affected by GHSA-hrxh-6v49-42gf (HTTP/2 Rapid Reset DoS); fix is v1.82.1 |
 | RS-1 | zk-pow | Low | Unsound `unsafe` aliasing in BLAKE3 trace gen (prover-side only; two copies) |
 | ZKP-2 | plonky2 | Info | Fork modifies soundness-critical verifier code; bundled audits cover upstream only |
 | ZKP-1 | zk-pow | Info | `extract_difficulty_bound` fails open on overflow (guarded upstream) |
@@ -803,6 +852,10 @@ available and used elsewhere in the tree.
 \* OYS-11 is conditional: it affects only users who explicitly opted into PQ
 addresses (`pq=true`), which is not the default and which the desktop wallet
 never requests.
+
+\*\*\* DEP-1 carries a High CVSS (8.8) upstream, but the only sub-issue that
+applies to Pearl is a DoS against the gRPC server, which is not started in
+default deployments.
 
 \*\* PKG-1 is latent: the package has no importer in this repository and the
 desktop wallet does not use it. It is rated Medium because it is a versioned,
@@ -847,11 +900,14 @@ Also not reviewed: `miner/`, `dnsseeder/`, `spv/` internals beyond validation,
 and the PearlBridge browser wallet (separate repository).
 
 Not performed:
-- **Dependency CVE scan.** `govulncheck` was rebuilt against Go 1.26.5 but the
-  review environment's network policy blocked `vuln.go.dev` and `api.osv.dev`
-  (403). Dependency versions look current (`x/crypto v0.53.0`,
-  `x/net v0.56.0`, `grpc v1.82.0`) but were not machine-checked. **Maintainers
-  should run `govulncheck ./...` — this is the largest unclosed gap.**
+- **Dependency CVE scan — partially closed.** `govulncheck` was rebuilt
+  against Go 1.26.5, but the review environment's egress policy blocks
+  `vuln.go.dev` and `api.osv.dev` (403 on CONNECT), so the reachability scan
+  could not run. A manual advisory cross-check was performed instead and found
+  **DEP-1** (`grpc v1.82.0`); `x/crypto` and `x/net` are ahead of their fix
+  versions. This is version matching, **not** call-graph reachability
+  analysis — it can miss advisories and cannot say whether vulnerable paths
+  are reachable. **Maintainers should still run `govulncheck ./...` in CI.**
 - Verification that released binaries correspond to this source; no
   reproducible-build or provenance attestation exists.
 - Dynamic testing, fuzzing, or any exploitation attempt.
