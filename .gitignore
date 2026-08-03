@@ -9,3 +9,5 @@ target
 assets/*.jam
 !crates/nockapp/test-jams
 keys.export
+pearl-security-review-*.zip
+pearl-security-review-*.tar.gz
